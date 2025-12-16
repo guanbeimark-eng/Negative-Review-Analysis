@@ -5,3 +5,4 @@ sentence-transformers
 torch
 openpyxl
 xlsxwriter
+scikit-learn
