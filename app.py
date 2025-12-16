@@ -11,7 +11,7 @@ import io
 # =========================
 # 0. 页面配置与安全验证
 # =========================
-st.set_page_config(page_title="AI 评论分析 (修复版)", page_icon="🔧", layout="wide")
+st.set_page_config(page_title="AI 评论分析 (语义修正版)", page_icon="🎯", layout="wide")
 
 ACCESS_PASSWORD = "admin123" 
 
@@ -30,29 +30,42 @@ if not st.session_state.logged_in:
     st.stop() 
 
 # =========================
-# 1. 标签库与关键词规则 (核心修复)
+# 1. 标签库与关键词规则 (深度优化)
 # =========================
-# 定义标签的同时，定义“强制关注词”。如果评论包含这些词，AI 会加倍关注对应标签。
+# 逻辑说明：如果评论中包含列表里的词，该标签的分数会获得巨大加成。
+
 POS_LABELS_MAP = {
-    "面料舒适/柔软": ["soft", "comfortable", "fabric", "material", "舒适", "软", "面料"],
-    "做工质量好": ["quality", "well made", "sturdy", "质量", "做工"],
-    "缓解疼痛/医疗效果": ["pain", "relief", "arthritis", "ache", "疼痛", "缓解", "关节炎"],
-    "尺码合身/舒适贴合": ["fit", "size", "snug", "perfect", "合身", "尺码"],
-    "增加抓握力/防滑": ["grip", "slip", "traction", "抓握", "滑"],
-    "耐用性强": ["durable", "last", "tear", "耐用", "破"],
+    # 提高 "功能性" 标签的优先级，防止被 "舒适" 掩盖
+    "提供压缩感/支撑力": ["compression", "pressure", "support", "tightness", "squeeze", "压力", "压缩", "支撑", "紧实", "包裹"],
+    "缓解疼痛/医疗效果": ["pain", "relief", "arthritis", "ache", "soothing", "hurts", "疼痛", "缓解", "关节炎", "止痛", "疗效"],
+    "增加抓握力/防滑": ["grip", "traction", "slip", "rubber", "抓握", "防滑", "摩擦", "稳"],
+    "保暖性能好": ["warm", "heat", "cold", "winter", "保暖", "热", "冷", "温"],
+    
+    # 通用标签放在后面
+    "面料舒适/柔软": ["soft", "comfortable", "fabric", "cotton", "smooth", "cozy", "舒适", "软", "棉", "舒服"],
+    "做工质量好": ["quality", "well made", "sturdy", "stitch", "质量", "做工", "缝线", "耐用"],
+    "尺码合身/舒适贴合": ["fit", "size", "snug", "perfect", "true to size", "合身", "合适", "贴合"],
+    "耐用性强": ["durable", "last", "wash", "wear", "耐用", "洗", "磨损"],
+    "灵活性好": ["dexterity", "flexible", "type", "write", "灵活", "打字", "活动"],
 }
 
 NEG_LABELS_MAP = {
-    "尺码太小/太紧/伸不进去": ["small", "tight", "fit", "cut off", "circulation", "cuff", "hand in", "紧", "小", "勒", "伸不进", "窄"],
-    "尺码太大/太松": ["big", "loose", "huge", "large", "松", "大", "长"],
-    "无效/没有作用": ["work", "effect", "useless", "help", "无效", "没用"],
-    "缝线开裂/破损": ["seam", "rip", "tear", "hole", "split", "缝线", "破", "洞", "开裂"],
-    "面料质量差/廉价": ["material", "thin", "cheap", "rough", "scratchy", "面料", "薄", "粗糙"],
-    "太滑/没有抓握力": ["slippery", "slide", "no grip", "smooth", "滑", "抓不住"],
-    "过敏/皮疹/发痒": ["rash", "itch", "allergy", "skin", "痒", "过敏", "红肿"]
+    # 针对您的案例1：增加 "袖口", "伸不进" 等具体场景词
+    "尺码太小/太紧/伸不进去": [
+        "small", "tight", "cut off", "circulation", "cuff", "hand in", "wrist", "opening", 
+        "restrict", "squeeze", "tiny", "child",
+        "紧", "小", "勒", "伸不进", "窄", "袖口", "穿不", "进不去", "卡住", "血液循环"
+    ],
+    "尺码太大/太松": ["big", "loose", "huge", "large", "baggy", "fall off", "long", "松", "大", "长", "掉"],
+    "太滑/没有抓握力": ["slippery", "slide", "no grip", "smooth", "plastic", "drop", "滑", "抓不住", "溜"],
+    "缝线开裂/破损": ["seam", "rip", "tear", "hole", "split", "fray", "thread", "unravel", "缝线", "破", "洞", "开裂", "线头", "裂"],
+    "无效/没有作用": ["work", "effect", "useless", "help", "difference", "waste", "无效", "没用", "智商税", "不值"],
+    "过敏/皮疹/发痒": ["rash", "itch", "allergy", "skin", "red", "bump", "痒", "过敏", "红肿", "刺挠"],
+    "面料质量差/廉价": ["material", "thin", "cheap", "rough", "scratchy", "junk", "paper", "面料", "薄", "粗糙", "廉价", "烂"],
+    "数量不符/发错货": ["count", "missing", "wrong", "received", "order", "数量", "少", "发错", "缺"],
 }
 
-# 提取纯标签列表供模型编码
+# 提取标签列表
 POS_LABELS = list(POS_LABELS_MAP.keys())
 NEG_LABELS = list(NEG_LABELS_MAP.keys())
 
@@ -64,10 +77,9 @@ def load_model():
     return SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
 
 # =========================
-# 3. 核心功能：混合打标 (关键词 + 语义)
+# 3. 核心功能：混合打标 (关键词 > 语义)
 # =========================
 def extract_dynamic_label(text, model, ngram_range=(2, 3)):
-    """提取新标签"""
     try:
         is_chinese = bool(re.search(r'[\u4e00-\u9fff]', text))
         analyzer_type = 'char' if is_chinese else 'word'
@@ -85,18 +97,16 @@ def extract_dynamic_label(text, model, ngram_range=(2, 3)):
 
 def hybrid_classify(df, model, match_threshold=0.35):
     """
-    混合打标逻辑：
-    1. 关键词增强：如果评论含有 "tight", "fit"，会给 "尺码" 类标签加分。
-    2. 语义匹配：使用 AI 计算向量相似度。
+    逻辑升级：
+    1. 关键词命中时，给予巨大加分 (Bonus +1.5)，确保覆盖语义相似度。
+    2. 如果有特定功能词（如“压力”），优先于通用词（如“舒适”）。
     """
     reviews = df['text'].tolist()
     
-    # 1. 向量编码
     review_embeddings = model.encode(reviews, convert_to_tensor=True)
     pos_embeddings = model.encode(POS_LABELS, convert_to_tensor=True)
     neg_embeddings = model.encode(NEG_LABELS, convert_to_tensor=True)
     
-    # 2. 计算原始相似度
     pos_sims = util.cos_sim(review_embeddings, pos_embeddings)
     neg_sims = util.cos_sim(review_embeddings, neg_embeddings)
     
@@ -113,24 +123,29 @@ def hybrid_classify(df, model, match_threshold=0.35):
         rating = df.iloc[i]['rating']
         text = str(df.iloc[i]['text']).lower()
         
-        # --- 关键词加权 (Booster) ---
-        # 如果评论里有 "tight"，则 "尺码太小" 的相似度分数 +0.3
+        # --- 关键词强力加权 ---
         
-        # 处理差评权重
+        # 1. 处理差评
         current_neg_scores = neg_sims[i].clone()
         for idx, label in enumerate(NEG_LABELS):
             keywords = NEG_LABELS_MAP[label]
+            # 检查是否包含关键词
             if any(k in text for k in keywords):
-                current_neg_scores[idx] += 0.35  # 显著提升包含关键词的标签分数
+                # +1.5 是一个巨大的权重，基本能保证只要有关键词，就选这个标签
+                current_neg_scores[idx] += 1.5 
 
-        # 处理好评权重
+        # 2. 处理好评
         current_pos_scores = pos_sims[i].clone()
         for idx, label in enumerate(POS_LABELS):
             keywords = POS_LABELS_MAP[label]
             if any(k in text for k in keywords):
-                current_pos_scores[idx] += 0.35
+                # 针对案例2：如果是"压缩/压力"类词，加分更高，压过"舒适"
+                if "压缩" in label or "compression" in label.lower():
+                     current_pos_scores[idx] += 2.0 
+                else:
+                     current_pos_scores[idx] += 1.5
 
-        # 获取加权后的最佳匹配
+        # 获取最佳匹配
         best_pos_idx = torch.argmax(current_pos_scores).item()
         best_pos_score = current_pos_scores[best_pos_idx].item()
         
@@ -141,8 +156,7 @@ def hybrid_classify(df, model, match_threshold=0.35):
         s_display = "未知"
         is_new = False
         
-        # --- 严格的情感判定 ---
-        # 3星绝对是差评
+        # --- 严格的情感判定 (修复评分逻辑) ---
         if rating <= 3:
             is_negative = True
         elif rating == 4:
@@ -153,6 +167,7 @@ def hybrid_classify(df, model, match_threshold=0.35):
         # --- 最终决策 ---
         if is_negative:
             s_display = "差评"
+            # 阈值判断：如果有关键词加成，分数肯定 > 1.0，直接通过
             if best_neg_score > match_threshold:
                 label = NEG_LABELS[best_neg_idx]
             else:
@@ -174,7 +189,7 @@ def hybrid_classify(df, model, match_threshold=0.35):
     return final_labels, sentiment_display, is_new_label
 
 # =========================
-# 4. 辅助工具 (评分修复)
+# 4. 辅助工具 (严格评分解析)
 # =========================
 def load_file(f):
     if f.name.lower().endswith(".csv"):
@@ -183,16 +198,12 @@ def load_file(f):
     return pd.read_excel(f)
 
 def parse_rating_strict(x):
-    """严格解析评分，强制转为 1-5 的整数"""
     if pd.isna(x): return np.nan
     s = str(x)
-    # 提取数字
     m = re.search(r"(\d+(\.\d+)?)", s)
     if m:
         val = float(m.group(1))
-        # 四舍五入并取整
-        val_int = int(round(val))
-        # 边界保护
+        val_int = int(round(val)) # 四舍五入
         if val_int < 1: val_int = 1
         if val_int > 5: val_int = 5
         return val_int
@@ -201,44 +212,35 @@ def parse_rating_strict(x):
 # =========================
 # 5. 主程序 UI
 # =========================
-st.title("📊 AI 评论分析 (Hybrid 增强版)")
+st.title("🎯 AI 评论分析 (精准语义修正版)")
 st.markdown("""
-**本次更新修复：**
-1. **评分修正**：强制将所有评分（如 3.0, 4.0）转为整数，准确统计 3 星差评。
-2. **打标修正**：引入“关键词规则”，当评论提到“袖口”、“伸不进”时，强制判定为【尺码问题】，不再误判为滑。
+**本次修正重点：**
+1. **解决“袖口伸不进”问题**：增加了 `袖口`, `伸不进`, `cuff` 等强规则词，强制识别为【尺码太小/太紧】。
+2. **解决“压力被泛化”问题**：提高了功能性词汇（如 `压力`, `compression`）的权重，优先于通用的“舒适”。
+3. **评分统计修复**：强制将所有评分（如 3.0）转为整数，准确统计差评。
 """)
 
-with st.spinner("AI 引擎启动中..."):
+with st.spinner("AI 引擎加载中..."):
     model = load_model()
 
 uploaded = st.file_uploader("上传评论文件 (CSV/Excel)", type=["csv", "xlsx"])
 
 if uploaded:
-    with st.spinner('正在清洗数据并进行混合分析...'):
+    with st.spinner('正在进行关键词增强分析...'):
         df = load_file(uploaded)
         
-        # 1. 字段识别
         all_cols = df.columns.tolist()
-        # 尝试找 rating 列，如果没有包含 "rating" 或 "星" 的列，默认用第几列
-        rating_col_candidates = [c for c in all_cols if "星" in str(c) or "rating" in str(c).lower() or "score" in str(c).lower()]
-        text_col_candidates = [c for c in all_cols if "内容" in str(c) or "review" in str(c).lower() or "text" in str(c).lower() or "body" in str(c).lower()]
-        
-        rating_col = rating_col_candidates[0] if rating_col_candidates else all_cols[0]
-        text_col = text_col_candidates[0] if text_col_candidates else all_cols[1]
+        rating_col = next((c for c in all_cols if "星" in str(c) or "rating" in str(c).lower()), all_cols[0])
+        text_col = next((c for c in all_cols if "内容" in str(c) or "review" in str(c).lower() or "text" in str(c).lower()), all_cols[1])
 
-        # 2. 严格清洗数据 (修复图1的问题)
-        # 强制转换为整数
+        # 严格清洗
         df["rating_clean"] = df[rating_col].apply(parse_rating_strict)
-        # 去除无效评分
         df = df.dropna(subset=["rating_clean"])
         df["rating_clean"] = df["rating_clean"].astype(int)
-        
         df["text"] = df[text_col].astype(str).fillna("")
-        
-        # 为了后续代码兼容，将 rating_clean 映射回 rating
         df["rating"] = df["rating_clean"]
         
-        # 3. 核心运算
+        # 核心运算
         labels, sentiments, is_new = hybrid_classify(df, model)
         df["标签"] = labels
         df["情感分类"] = sentiments
@@ -247,82 +249,75 @@ if uploaded:
     st.success("✅ 分析完成！")
 
     # =========================
-    # A: 宏观概览 (修复版)
+    # A: 宏观概览
     # =========================
     st.markdown("---")
-    st.header("1. 宏观数据概览 (已修复)")
-    
+    st.header("1. 宏观概览")
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("评论总数", len(df))
-    
     avg_score = df['rating'].mean()
     k2.metric("平均评分", f"{avg_score:.2f} ⭐")
     
-    # 严格计算 <=3 星
-    neg_df = df[df['rating'] <= 3]
-    neg_count = len(neg_df)
+    neg_count = len(df[df['rating'] <= 3])
     neg_rate = (neg_count / len(df) * 100) if len(df) > 0 else 0
-    
     k3.metric("差评占比 (<=3星)", f"{neg_rate:.1f}%", delta_color="inverse")
-    k4.metric("新标签挖掘数", sum(is_new))
+    k4.metric("新标签挖掘", sum(is_new))
     
-    # 星级分布图 (修复为离散柱状图)
-    st.subheader("评分等级分布")
-    # 强制统计 1-5 的每一个数量，即使是 0 也要显示
+    # 评分分布
     counts = df['rating'].value_counts().reindex([1,2,3,4,5], fill_value=0).reset_index()
     counts.columns = ["星级", "数量"]
-    # 强制星级为字符串，防止 Plotly 把它当连续数字画
     counts["星级"] = counts["星级"].astype(str) + "星"
-    
     fig_bar = px.bar(counts, x="星级", y="数量", text="数量", color="数量", color_continuous_scale="Blues")
     st.plotly_chart(fig_bar, use_container_width=True)
 
     # =========================
-    # B: 深度可视化
+    # B: 深度分析
     # =========================
     st.markdown("---")
     st.header("2. 标签深度分析")
-    
     c1, c2 = st.columns(2)
     with c1:
-        st.caption("情感分布环形图")
         s_counts = df["情感分类"].value_counts().reset_index()
         s_counts.columns = ["情感", "数量"]
         fig_pie = px.pie(s_counts, values="数量", names="情感", hole=0.4, 
                          color="情感", color_discrete_map={"好评":"#2ecc71", "差评":"#e74c3c"})
         st.plotly_chart(fig_pie, use_container_width=True)
-        
     with c2:
-        st.caption("问题层级旭日图")
-        # 过滤低频
         viz_df = df.copy()
         tc = viz_df["标签"].value_counts()
         viz_df["标签展示"] = viz_df["标签"].apply(lambda x: x if tc[x] > 0 else "其他")
-        
         sun_df = viz_df.groupby(["情感分类", "标签展示"]).size().reset_index(name="数量")
         fig_sun = px.sunburst(sun_df, path=['情感分类', '标签展示'], values='数量',
                               color='情感分类', color_discrete_map={"好评":"#2ecc71", "差评":"#e74c3c"})
         st.plotly_chart(fig_sun, use_container_width=True)
 
     # =========================
-    # C: 差评原声 (验证修复结果)
+    # C: 验证区 (查找特定评论)
     # =========================
     st.markdown("---")
-    st.header("3. 差评原声透视")
-    st.caption("请检查：'尺码问题' 是否包含了抱怨袖口紧的评论")
+    st.header("3. 结果验证")
+    st.caption("检查特定标签下的评论是否准确")
     
-    if not neg_df.empty:
-        # 只看差评
-        neg_issues = neg_df["标签"].value_counts().index.tolist()
-        selected_issue = st.selectbox("选择差评标签查看:", neg_issues)
-        
-        reviews = neg_df[neg_df["标签"] == selected_issue][["rating", "text"]]
-        
-        st.markdown(f"**标签【{selected_issue}】下的评论:**")
-        for idx, row in reviews.iterrows():
-            st.warning(f"[{row['rating']}星] {row['text']}")
-    else:
-        st.info("恭喜，当前数据中没有 <=3 星的差评。")
+    col_v1, col_v2 = st.columns(2)
+    with col_v1:
+        # 差评验证
+        neg_issues = df[df["情感分类"] == "差评"]["标签"].unique().tolist()
+        if neg_issues:
+            sel_neg = st.selectbox("查看差评标签:", neg_issues)
+            reviews_n = df[df["标签"] == sel_neg]["text"].head(3)
+            for r in reviews_n: st.error(r)
+        else:
+            st.info("无差评")
+            
+    with col_v2:
+        # 好评验证
+        pos_issues = df[df["情感分类"] == "好评"]["标签"].unique().tolist()
+        if pos_issues:
+            sel_pos = st.selectbox("查看好评标签:", pos_issues)
+            reviews_p = df[df["标签"] == sel_pos]["text"].head(3)
+            for r in reviews_p: st.success(r)
+        else:
+            st.info("无好评")
 
     # =========================
     # 下载
@@ -331,5 +326,4 @@ if uploaded:
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
         df.to_excel(writer, index=False, sheet_name='Result')
-    
     st.download_button("⬇️ 下载 Excel 结果", buffer.getvalue(), "fixed_analysis.xlsx", "application/vnd.ms-excel")
