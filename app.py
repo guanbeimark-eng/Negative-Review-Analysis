@@ -2,26 +2,52 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
+import matplotlib.font_manager as fm
 from sentence_transformers import SentenceTransformer, util
 import torch
 import re
 import io
+import warnings
+
+# 忽略不必要的警告
+warnings.filterwarnings('ignore')
 
 # =========================
-# 0. 页面配置与基础设置
+# 0. 页面配置与字体修复
 # =========================
 st.set_page_config(
-    page_title="AI 深度语义分析看板 (可视化增强版)",
+    page_title="AI 全维评论分析看板 (Pro Ver.)",
     page_icon="📊",
     layout="wide"
 )
 
-# Matplotlib 中文支持与样式设置
-plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS', 'sans-serif'] # 适配 Windows/Mac
-plt.rcParams['axes.unicode_minus'] = False
-plt.style.use('ggplot') # 使用更好看的绘图风格
+# --- 字体自动配置逻辑 (防止云端中文乱码) ---
+def configure_matplotlib_font():
+    """
+    尝试找到系统可用的中文字体，如果找不到则回退到默认
+    """
+    # 常见中文字体列表 (Windows, Mac, Linux)
+    font_candidates = ['SimHei', 'Microsoft YaHei', 'PingFang SC', 'Heiti TC', 'WenQuanYi Micro Hei', 'Droid Sans Fallback']
+    
+    system_fonts = set(f.name for f in fm.fontManager.ttflist)
+    found_font = None
+    
+    for f in font_candidates:
+        if f in system_fonts:
+            found_font = f
+            break
+            
+    if found_font:
+        plt.rcParams['font.sans-serif'] = [found_font] + plt.rcParams['font.sans-serif']
+    else:
+        # 如果实在没找到，尝试设置为 sans-serif，至少显示英文
+        plt.rcParams['font.sans-serif'] = ['sans-serif']
+        
+    plt.rcParams['axes.unicode_minus'] = False # 解决负号显示为方块的问题
 
+configure_matplotlib_font()
+
+# --- 访问密码 ---
 ACCESS_PASSWORD = "admin123" 
 
 if "logged_in" not in st.session_state:
@@ -39,7 +65,7 @@ if not st.session_state.logged_in:
     st.stop() 
 
 # =========================
-# 1. 标签库定义
+# 1. 标签库定义 (固定集合)
 # =========================
 POS_LABELS_LIST = [
     "面料舒适", "质量很好", "有助于锻炼", "有助于缓解疼痛", "保暖", "舒适贴合", 
@@ -64,29 +90,31 @@ def load_model():
 # 3. 核心 NLP 引擎
 # =========================
 def split_into_sentences(text):
-    """拆句"""
+    """拆句逻辑"""
     if not isinstance(text, str): return []
     sentences = re.split(r'[.!?;。！？；\n]+', text)
     return [s.strip() for s in sentences if len(s.strip()) > 1]
 
-def analyze_single_review(row_idx, rating, full_text, model, threshold=0.35):
-    """拆句并打标"""
+def analyze_single_review(row_idx, rating, date_val, full_text, model, threshold=0.40):
+    """单条评论深度拆解"""
     sentences = split_into_sentences(full_text)
     analyzed_results = []
     
     pos_embeddings = model.encode(POS_LABELS_LIST, convert_to_tensor=True)
     neg_embeddings = model.encode(NEG_LABELS_LIST, convert_to_tensor=True)
     
+    # 基于星级的基准情感
     review_polarity_base = "negative" if rating <= 3 else "positive"
 
-    # 如果无法拆句，整句处理
+    # 无法拆句或空评论处理
     if not sentences:
         fallback_label = "差评其他" if review_polarity_base == "negative" else "好评其他"
         return [{
             "review_id": row_idx,
+            "date": date_val,
             "rating": rating,
             "original_review": full_text,
-            "sentence": full_text,
+            "sentence": full_text[:50], # 截取部分作为展示
             "polarity": review_polarity_base,
             "label": fallback_label,
             "evidence": full_text,
@@ -107,6 +135,7 @@ def analyze_single_review(row_idx, rating, full_text, model, threshold=0.35):
         matched_polarity = None
         confidence = 0.0
 
+        # 胜者通吃逻辑
         if best_pos_score > best_neg_score:
             if best_pos_score > threshold:
                 matched_label = POS_LABELS_LIST[best_pos_idx]
@@ -121,6 +150,7 @@ def analyze_single_review(row_idx, rating, full_text, model, threshold=0.35):
         if matched_label:
             analyzed_results.append({
                 "review_id": row_idx,
+                "date": date_val,
                 "rating": rating,
                 "original_review": full_text,
                 "sentence": sent,
@@ -130,14 +160,15 @@ def analyze_single_review(row_idx, rating, full_text, model, threshold=0.35):
                 "confidence": round(confidence, 4)
             })
 
-    # 兜底：如果没有任一句子匹配到标签
+    # 兜底：如果整条评论没有任何句子匹配到标签
     if not analyzed_results:
         fallback_label = "差评其他" if review_polarity_base == "negative" else "好评其他"
         analyzed_results.append({
             "review_id": row_idx,
+            "date": date_val,
             "rating": rating,
             "original_review": full_text,
-            "sentence": "(无明确特征语义)",
+            "sentence": "(无明确特征)",
             "polarity": review_polarity_base,
             "label": fallback_label,
             "evidence": full_text,
@@ -167,196 +198,166 @@ def parse_rating_strict(x):
 # =========================
 # 5. 主程序 UI
 # =========================
-st.title("📊 AI 深度语义分析看板")
+st.title("📊 AI 全维评论分析看板 (可视化增强版)")
 st.markdown("""
-**核心能力：**
-1. **语义拆解**：解决“一条评论既说好又说坏”的分析难题。
-2. **强证据关联**：所有分析结果均可回溯到具体的原文句子。
-3. **多维可视化**：无需 Plotly，使用原生 Matplotlib 绘制高级嵌套图表。
+**核心功能：**
+1. **语义拆解**：自动拆分长难句，精准归类好评与差评点。
+2. **多维可视化**：包含情感分布、标签对比、星级交叉分析及时间趋势（若有日期）。
+3. **强证据链**：所有分析结果均关联原文句子。
 """)
 
-with st.spinner("AI 模型加载中..."):
+with st.spinner("正在加载 AI 神经模型..."):
     model = load_model()
 
 uploaded = st.file_uploader("上传文件 (CSV/Excel)", type=["csv", "xlsx"])
 
 if uploaded:
-    with st.spinner('AI 正在逐句阅读分析...'):
+    with st.spinner('正在进行深度语义拆解...'):
         df_raw = load_file(uploaded)
         
+        # 字段智能识别
         all_cols = df_raw.columns.tolist()
+        # 1. 星级列
         rating_col = next((c for c in all_cols if "星" in str(c) or "rating" in str(c).lower()), all_cols[0])
+        # 2. 内容列
         text_col = next((c for c in all_cols if "内容" in str(c) or "review" in str(c).lower() or "text" in str(c).lower()), all_cols[1])
+        # 3. 日期列 (可选)
+        date_col = next((c for c in all_cols if "时间" in str(c) or "date" in str(c).lower() or "time" in str(c).lower()), None)
         
+        # 清洗
         df_raw["rating_clean"] = df_raw[rating_col].apply(parse_rating_strict)
         df_raw = df_raw.dropna(subset=["rating_clean"])
         df_raw["text_clean"] = df_raw[text_col].astype(str).fillna("")
         
+        # 处理日期
+        has_date = False
+        if date_col:
+            try:
+                df_raw["date_clean"] = pd.to_datetime(df_raw[date_col], errors='coerce')
+                if df_raw["date_clean"].notna().sum() > 0:
+                    has_date = True
+            except:
+                pass
+        
+        if not has_date:
+            df_raw["date_clean"] = None
+
+        # 核心分析循环
         all_results = []
         progress_bar = st.progress(0)
         total = len(df_raw)
         
         for idx, row in df_raw.iterrows():
             if idx % 10 == 0: progress_bar.progress(idx / total)
-            res = analyze_single_review(idx, row["rating_clean"], row["text_clean"], model)
+            res = analyze_single_review(
+                idx, 
+                row["rating_clean"], 
+                row["date_clean"], 
+                row["text_clean"], 
+                model
+            )
             all_results.extend(res)
         
         progress_bar.empty()
+        
+        # 转换为打标层级的 DataFrame
         detailed_df = pd.DataFrame(all_results)
 
-    st.success(f"✅ 分析完成！解析出 {len(detailed_df)} 个语义切片。")
+    st.success(f"✅ 分析完成！从 {len(df_raw)} 条评论中拆解出 {len(detailed_df)} 个语义单元。")
 
-    # =========================
-    # 可视化 A: 宏观与星级
-    # =========================
+    # ==========================================
+    # 维度 1: 宏观概览 (KPI & 基础分布)
+    # ==========================================
     st.markdown("---")
     st.header("1. 宏观数据概览")
     
-    col_kpi1, col_kpi2, col_kpi3 = st.columns(3)
-    col_kpi1.metric("总评论数", len(df_raw))
-    col_kpi2.metric("平均评分", f"{df_raw['rating_clean'].mean():.2f} ⭐")
-    neg_rate = (len(df_raw[df_raw['rating_clean']<=3])/len(df_raw))*100
-    col_kpi3.metric("差评率 (<=3星)", f"{neg_rate:.1f}%", delta_color="inverse")
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("总评论数", len(df_raw))
+    k1.metric("语义单元数", len(detailed_df), help="一条评论可能拆分成多个语义点")
+    
+    avg_score = df_raw['rating_clean'].mean()
+    k2.metric("平均评分", f"{avg_score:.2f} ⭐")
+    
+    # 差评率
+    neg_reviews = len(df_raw[df_raw['rating_clean']<=3])
+    k3.metric("差评率 (Review Level)", f"{(neg_reviews/len(df_raw)*100):.1f}%", delta_color="inverse")
 
-    # 星级分布图 (Matplotlib)
-    fig_stars, ax_stars = plt.subplots(figsize=(10, 3))
+    # 绘制星级分布 (Bar Chart)
+    st.subheader("评分星级分布")
     star_counts = df_raw['rating_clean'].value_counts().reindex([1,2,3,4,5], fill_value=0).sort_index()
-    colors_stars = ['#e74c3c', '#e67e22', '#f1c40f', '#3498db', '#2ecc71'] # 红到绿
-    bars = ax_stars.bar(star_counts.index, star_counts.values, color=colors_stars, alpha=0.8)
-    ax_stars.set_title('星级评分分布')
-    ax_stars.set_xticks([1,2,3,4,5])
-    ax_stars.set_ylabel('评论数量')
-    ax_stars.grid(axis='y', linestyle='--', alpha=0.3)
-    # 标数值
+    
+    fig1, ax1 = plt.subplots(figsize=(10, 3))
+    colors = ['#e74c3c', '#e67e22', '#f1c40f', '#3498db', '#2ecc71']
+    bars = ax1.bar(star_counts.index, star_counts.values, color=colors, alpha=0.9)
+    ax1.set_xticks([1,2,3,4,5])
+    ax1.set_ylabel("数量")
+    ax1.grid(axis='y', linestyle='--', alpha=0.3)
+    
+    # 添加数值标签
     for bar in bars:
         height = bar.get_height()
-        ax_stars.text(bar.get_x() + bar.get_width()/2., height,
-                f'{int(height)}', ha='center', va='bottom')
-    st.pyplot(fig_stars)
-
-    # =========================
-    # 可视化 B: 情感与标签 (嵌套环形图)
-    # =========================
-    st.markdown("---")
-    st.header("2. 市场深度分析 (Nested Analysis)")
+        ax1.text(bar.get_x() + bar.get_width()/2., height,
+                 f'{int(height)}', ha='center', va='bottom')
     
-    col_viz1, col_viz2 = st.columns([1.5, 1])
+    st.pyplot(fig1)
 
-    with col_viz1:
-        st.subheader("情感与标签构成 (嵌套环形图)")
-        st.caption("内圈：情感 (正/负) | 外圈：具体标签")
-        
-        # 准备数据
-        # 1. 情感分布
-        polarity_counts = detailed_df['polarity'].value_counts()
-        # 2. 标签分布
-        label_counts = detailed_df.groupby(['polarity', 'label']).size()
-        
-        # 绘图数据准备
-        inner_labels = polarity_counts.index
-        inner_sizes = polarity_counts.values
-        inner_colors = ['#2ecc71' if l=='positive' else '#e74c3c' for l in inner_labels]
-        
-        # 外圈数据对齐
-        outer_sizes = []
-        outer_colors = []
-        outer_labels_text = []
-        
-        for pol in inner_labels:
-            if pol in label_counts:
-                sub_labels = label_counts[pol].sort_values(ascending=False)
-                # 只显示Top N标签，其他的归为"其他"以防图表太乱
-                top_n = sub_labels.head(6)
-                others = sub_labels.iloc[6:].sum()
-                
-                # 基础颜色
-                base_color = '#27ae60' if pol=='positive' else '#c0392b'
-                alphas = np.linspace(0.9, 0.3, len(top_n) + (1 if others > 0 else 0))
-                
-                for idx, (lbl, count) in enumerate(top_n.items()):
-                    outer_sizes.append(count)
-                    outer_labels_text.append(lbl if count/len(detailed_df) > 0.02 else "") # 占比太小不显示文字
-                    # 变色处理
-                    outer_colors.append(base_color) # 简化：使用纯色，或者可以调整透明度
-                
-                if others > 0:
-                    outer_sizes.append(others)
-                    outer_labels_text.append("")
-                    outer_colors.append(base_color)
-
-        fig_pie, ax_pie = plt.subplots(figsize=(8, 8))
-        
-        # 外圈
-        ax_pie.pie(outer_sizes, labels=outer_labels_text, radius=1, 
-                   colors=outer_colors, wedgeprops=dict(width=0.3, edgecolor='w'),
-                   textprops={'fontsize': 9}, labeldistance=1.05)
-        
-        # 内圈
-        ax_pie.pie(inner_sizes, labels=[l.upper() for l in inner_labels], radius=0.7, 
-                   colors=inner_colors, wedgeprops=dict(width=0.3, edgecolor='w'),
-                   textprops={'fontsize': 12, 'weight': 'bold', 'color': 'white'}, labeldistance=0.6)
-        
-        ax_pie.set(aspect="equal")
-        st.pyplot(fig_pie)
-
-    with col_viz2:
-        st.subheader("标签排行榜 (Top 10)")
-        
-        top_labels = detailed_df['label'].value_counts().head(10).sort_values()
-        
-        fig_barh, ax_barh = plt.subplots(figsize=(6, 8))
-        # 颜色映射
-        bar_colors = []
-        for l in top_labels.index:
-            if l in POS_LABELS_LIST: bar_colors.append('#2ecc71')
-            elif l in NEG_LABELS_LIST: bar_colors.append('#e74c3c')
-            else: bar_colors.append('#95a5a6')
-            
-        ax_barh.barh(top_labels.index, top_labels.values, color=bar_colors)
-        ax_barh.set_xlabel("提及次数")
-        
-        # 图例
-        pos_patch = mpatches.Patch(color='#2ecc71', label='好评')
-        neg_patch = mpatches.Patch(color='#e74c3c', label='差评')
-        other_patch = mpatches.Patch(color='#95a5a6', label='其他')
-        ax_barh.legend(handles=[pos_patch, neg_patch, other_patch], loc='lower right')
-        
-        st.pyplot(fig_barh)
-
-    # =========================
-    # C: 证据回溯与原声
-    # =========================
+    # ==========================================
+    # 维度 2: 标签深度分析 (好评 vs 差评)
+    # ==========================================
     st.markdown("---")
-    st.header("3. 痛点原声透视")
-    st.caption("基于语义拆解，直接定位到差评的具体句子")
+    st.header("2. 标签深度透视")
     
-    # 筛选差评标签
-    neg_options = detailed_df[detailed_df['polarity']=='negative']['label'].unique()
-    if len(neg_options) > 0:
-        selected_neg = st.selectbox("选择差评问题:", neg_options)
+    c1, c2 = st.columns(2)
+    
+    # --- 左侧：情感占比饼图 ---
+    with c1:
+        st.subheader("语义情感占比")
+        pol_counts = detailed_df['polarity'].value_counts()
+        fig2, ax2 = plt.subplots(figsize=(6, 6))
+        ax2.pie(pol_counts.values, labels=pol_counts.index, autopct='%1.1f%%', 
+                colors=['#2ecc71', '#e74c3c'], startangle=140, explode=(0.05, 0))
+        ax2.set_title("Sentiment Distribution")
+        st.pyplot(fig2)
         
-        evidence_data = detailed_df[detailed_df['label'] == selected_neg]
-        st.write(f"共发现 {len(evidence_data)} 处相关反馈：")
+    # --- 右侧：标签 Top 榜单 (对比图) ---
+    with c2:
+        st.subheader("Top 标签对比")
+        # 分别提取好评和差评的前5名
+        top_pos = detailed_df[detailed_df['polarity']=='positive']['label'].value_counts().head(5)
+        top_neg = detailed_df[detailed_df['polarity']=='negative']['label'].value_counts().head(5)
         
-        for i, row in evidence_data.head(5).iterrows():
-            with st.expander(f"来自评分 {row['rating']}星的评论"):
-                st.markdown(f"**原声证据:** :red[{row['evidence']}]")
-                st.caption(f"**完整上下文:** {row['original_review']}")
-    else:
-        st.info("数据中未发现明显差评。")
+        # 合并绘图数据
+        labels = list(top_pos.index) + list(top_neg.index)
+        counts = list(top_pos.values) + list(top_neg.values)
+        colors = ['#2ecc71']*len(top_pos) + ['#e74c3c']*len(top_neg)
+        
+        fig3, ax3 = plt.subplots(figsize=(6, 6))
+        y_pos = np.arange(len(labels))
+        ax3.barh(y_pos, counts, color=colors)
+        ax3.set_yticks(y_pos)
+        ax3.set_yticklabels(labels)
+        ax3.invert_yaxis() # 最大的在上面
+        ax3.set_xlabel("提及次数")
+        ax3.set_title("Top Positive vs Top Negative Labels")
+        st.pyplot(fig3)
 
-    # =========================
-    # 下载区
-    # =========================
+    # ==========================================
+    # 维度 3: 交叉分析 (星级 x 情感)
+    # ==========================================
     st.markdown("---")
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-        detailed_df.to_excel(writer, index=False, sheet_name='Detailed_Analysis')
-        df_raw.to_excel(writer, index=False, sheet_name='Raw_Data')
-        
-    st.download_button(
-        label="⬇️ 下载完整 Excel 分析报表",
-        data=buffer.getvalue(),
-        file_name="sentiment_analysis_report.xlsx",
-        mime="application/vnd.ms-excel"
-    )
+    st.header("3. 交叉分析：星级背后的真实声音")
+    st.caption("检查：高分评论里是否藏着差评标签？低分评论里是否有好评点？")
+    
+    # 交叉表：星级 vs 情感
+    cross_tab = pd.crosstab(detailed_df['rating'], detailed_df['polarity'])
+    
+    fig4, ax4 = plt.subplots(figsize=(10, 5))
+    cross_tab.plot(kind='bar', stacked=True, color=['#e74c3c', '#2ecc71'], ax=ax4)
+    ax4.set_xlabel("星级")
+    ax4.set_ylabel("语义单元数量")
+    ax4.set_title("星级与情感分布堆叠图")
+    ax4.legend(["Negative (差评点)", "Positive (好评点)"], loc='upper left')
+    plt.xticks(rotation=0)
+    st.pyplot(fig4)
+    
+    #
