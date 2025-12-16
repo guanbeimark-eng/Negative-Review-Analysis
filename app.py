@@ -1,19 +1,19 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import json
 import uuid
 import re
-import numpy as np
 from typing import List, Dict, Any, Optional
 
-# OpenAI SDK (pip install openai)
 from openai import OpenAI
 
 # =========================
-# 0) App Config + Login
+# 0) App Config + (可选)登录
 # =========================
-st.set_page_config(page_title="评论自动打标（傻瓜式一键版）", page_icon="🏷️", layout="wide")
+st.set_page_config(page_title="评论自动打标（一键版）", page_icon="🏷️", layout="wide")
 
+# 如果你不需要登录，直接把这段删掉即可
 ACCESS_PASSWORD = "admin123"
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
@@ -35,11 +35,13 @@ if not st.session_state.logged_in:
 # =========================
 DEFAULT_TAG_LIBRARY = {
     "positive": [
-        "佩戴舒适", "支撑性好", "缓解关节不适", "尺寸合适", "质量好", "性价比高", "效果明显", "物流/发货快", "外观好看"
+        "佩戴舒适", "支撑性好", "缓解关节不适", "尺寸合适", "质量好",
+        "性价比高", "效果明显", "物流/发货快", "外观好看"
     ],
     "negative": [
-        "尺码偏小", "尺码偏大", "尺码不一致", "不适合男士", "穿戴困难", "质量差", "与描述不符",
-        "不舒适/勒手", "气味/异味", "耐用性差/易破", "压力/压缩感不足"
+        "尺码偏小", "尺码偏大", "尺码不一致", "不适合男士", "穿戴困难",
+        "质量差", "与描述不符", "不舒适/勒手", "气味/异味",
+        "耐用性差/易破", "压力/压缩感不足"
     ]
 }
 
@@ -48,13 +50,15 @@ DEFAULT_TAG_LIBRARY = {
 # =========================
 defaults = {
     "raw_df": None,
-    "main_df": None,          # 清洗后主表（原字段 + rating_int + sys_id + __text__）
-    "norm_df": None,          # id/rating/text
-    "full_df": None,          # 主表+AI_Label 合并后的导出表
+    "main_df": None,      # 清洗后主表：原字段 + rating_int + sys_id + __text__
+    "norm_df": None,      # 标准表：id/rating/text/AI_Label
+    "full_df": None,      # 主表合并 AI_Label 后的导出表
     "col_map": None,
-    "tag_config": {"pos": DEFAULT_TAG_LIBRARY["positive"],
-                   "neg": DEFAULT_TAG_LIBRARY["negative"],
-                   "all": DEFAULT_TAG_LIBRARY["positive"] + DEFAULT_TAG_LIBRARY["negative"]},
+    "tag_config": {
+        "pos": DEFAULT_TAG_LIBRARY["positive"],
+        "neg": DEFAULT_TAG_LIBRARY["negative"],
+        "all": DEFAULT_TAG_LIBRARY["positive"] + DEFAULT_TAG_LIBRARY["negative"],
+    },
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -63,17 +67,20 @@ for k, v in defaults.items():
 # =========================
 # 3) Utils
 # =========================
-def load_file(f):
+def load_file(f) -> pd.DataFrame:
     name = f.name.lower()
     if name.endswith(".csv"):
         try:
             return pd.read_csv(f, encoding="utf-8")
         except UnicodeDecodeError:
             return pd.read_csv(f, encoding="gbk")
+    # xlsx
     return pd.read_excel(f)
 
-def parse_rating(x):
-    """兼容：'4.0 out of 5 stars' / 'Rated 3' / '5' / 4.0"""
+def parse_rating(x) -> float:
+    """
+    兼容 rating: '4.0 out of 5 stars' / 'Rated 3' / '5' / 4.0
+    """
     if pd.isna(x):
         return np.nan
     s = str(x)
@@ -82,7 +89,7 @@ def parse_rating(x):
         return np.nan
     try:
         return float(m.group(1))
-    except:
+    except Exception:
         return np.nan
 
 COLUMN_CANDIDATES = {
@@ -94,18 +101,20 @@ COLUMN_CANDIDATES = {
     "id": ["review_id", "id", "ID", "评论ID", "uuid", "唯一ID"],
 }
 
-def auto_match_column(cols, candidates):
+def auto_match_column(cols: List[str], candidates: List[str]) -> Optional[str]:
+    # 精确匹配
     for c in candidates:
         if c in cols:
             return c
+    # 模糊包含匹配
     for cand in candidates:
-        cl = cand.lower()
+        cand_l = cand.lower()
         for col in cols:
-            if cl in col.lower():
+            if cand_l in col.lower():
                 return col
     return None
 
-def auto_build_mapping(df):
+def auto_build_mapping(df: pd.DataFrame) -> Dict[str, Optional[str]]:
     cols = df.columns.tolist()
     col_rating = auto_match_column(cols, COLUMN_CANDIDATES["rating"])
     col_title = auto_match_column(cols, COLUMN_CANDIDATES["title"])
@@ -114,38 +123,47 @@ def auto_build_mapping(df):
     col_date = auto_match_column(cols, COLUMN_CANDIDATES["date"])
     col_id = auto_match_column(cols, COLUMN_CANDIDATES["id"])
 
+    # 文本优先翻译列
     text_primary = col_trans or col_content
+
     return {
         "rating": col_rating,
         "title": col_title,
-        "text": text_primary,   # 优先翻译列
+        "text": text_primary,
         "date": col_date,
         "id": col_id,
         "content_raw": col_content,
-        "translation": col_trans
+        "translation": col_trans,
     }
 
-def build_cleaned_frames(df_raw, m):
+def build_cleaned_frames(df_raw: pd.DataFrame, m: Dict[str, Optional[str]]):
     tmp = df_raw.copy()
 
-    tmp["rating_numeric"] = tmp[m["rating"]].apply(parse_rating) if m.get("rating") else np.nan
+    # rating 解析
+    if not m.get("rating"):
+        tmp["rating_numeric"] = np.nan
+    else:
+        tmp["rating_numeric"] = tmp[m["rating"]].apply(parse_rating)
     invalid_rating_cnt = int(tmp["rating_numeric"].isna().sum())
 
     valid = tmp.dropna(subset=["rating_numeric"]).copy()
     valid["rating_int"] = valid["rating_numeric"].round().astype(int)
     valid = valid[valid["rating_int"].between(1, 5)]
 
+    # date 解析（可选）
     time_ok = False
     if m.get("date") and m["date"] in valid.columns:
         valid["date_parsed"] = pd.to_datetime(valid[m["date"]], errors="coerce")
         time_ok = valid["date_parsed"].notna().sum() > 0
 
+    # sys_id：优先用文件自带 ID，否则生成
     if m.get("id") and m["id"] in valid.columns:
         valid["sys_id"] = valid[m["id"]].astype(str)
     else:
         valid["sys_id"] = [str(uuid.uuid4())[:8] for _ in range(len(valid))]
 
-    if m.get("text") is None:
+    # text：title 可选拼接
+    if not m.get("text"):
         valid["__text__"] = ""
     else:
         if m.get("title") and m["title"] in valid.columns:
@@ -157,24 +175,27 @@ def build_cleaned_frames(df_raw, m):
         else:
             valid["__text__"] = valid[m["text"]].fillna("").astype(str)
 
-    norm = valid[["sys_id", "rating_int", "__text__"]].rename(columns={
-        "sys_id": "id",
-        "rating_int": "rating",
-        "__text__": "text"
-    }).copy()
+    norm = valid[["sys_id", "rating_int", "__text__"]].rename(
+        columns={"sys_id": "id", "rating_int": "rating", "__text__": "text"}
+    ).copy()
 
     return valid, norm, invalid_rating_cnt, time_ok
 
+def validate_label(label: str, allowed_set: set) -> str:
+    lab = (label or "").strip()
+    return lab if lab in allowed_set else ""
+
 def strict_json_load(s: str) -> Optional[Any]:
-    """尽量从模型输出里抠出 JSON（支持包裹在```里、前后有杂字的情况）"""
+    """
+    尽量从模型输出里抠出 JSON list（即使夹带了其它字）
+    """
     if not s:
         return None
     s = s.strip().replace("```json", "").replace("```", "").strip()
 
-    # 直接尝试
     try:
         return json.loads(s)
-    except:
+    except Exception:
         pass
 
     # 尝试提取第一个 [...] 段
@@ -182,13 +203,9 @@ def strict_json_load(s: str) -> Optional[Any]:
     if m:
         try:
             return json.loads(m.group(1))
-        except:
+        except Exception:
             return None
     return None
-
-def validate_label(label: str, allowed_set: set) -> str:
-    lab = (label or "").strip()
-    return lab if lab in allowed_set else ""
 
 # =========================
 # 4) OpenAI 调用：一键自动打标
@@ -231,8 +248,8 @@ def call_openai_tagging(client: OpenAI,
                         prompt: str,
                         max_retries: int = 2) -> List[Dict[str, str]]:
     """
-    返回：[{id,label}, ...]
-    失败会重试（让模型只输出 JSON）
+    必须返回：[{id,label}, ...]
+    失败会重试（加强约束）
     """
     last_text = ""
     for attempt in range(max_retries + 1):
@@ -240,45 +257,43 @@ def call_openai_tagging(client: OpenAI,
             model=model,
             input=prompt
         )
-        # SDK Quickstart: response.output_text 取文本输出 :contentReference[oaicite:2]{index=2}
         text = getattr(resp, "output_text", "") or ""
         last_text = text
 
         obj = strict_json_load(text)
         if isinstance(obj, list) and all(isinstance(x, dict) and "id" in x and "label" in x for x in obj):
-            # 正常
             return [{"id": str(x["id"]), "label": str(x.get("label", "")).strip()} for x in obj]
 
-        # 重试：给更强约束
         prompt = (
             "再次强调：你只能输出 JSON list，且每个元素只允许包含 id 和 label 两个键。\n"
             "不要输出任何解释，不要输出 ```。\n\n"
             + prompt
         )
 
-    raise ValueError(f"模型输出无法解析为 [{'{id,label}'}] JSON。原始输出片段：{last_text[:500]}")
+    raise ValueError(f"模型输出无法解析为 JSON list[{ '{id,label}' }]，原始输出片段：{last_text[:500]}")
 
 # =========================
-# 5) UI：真正傻瓜式（一个主按钮）
+# 5) UI：真正傻瓜式（上传 → 一键打标 → 下载）
 # =========================
-st.title("🏷️ 评论自动打标（傻瓜式：上传 → 一键打标 → 导出）")
+st.title("🏷️ 评论自动打标（上传 → 一键打标 → 导出）")
+st.caption("用户无需复制/粘贴任何 JSON。")
 
-with st.expander("① 配置 OpenAI API（只需一次）", expanded=True):
-    st.caption("建议把 API Key 配在服务器环境变量 OPENAI_API_KEY；也可在此临时输入（仅服务端使用）。")
-    api_key = st.text_input("OpenAI API Key", type="password", value="")
-    model_name = st.text_input("模型（默认 gpt-5.2）", value="gpt-5.2")
+# API Key：从 Streamlit Secrets 读取（最推荐）
+api_key = st.secrets.get("OPENAI_API_KEY", "")
+if not api_key:
+    st.warning("未检测到 OPENAI_API_KEY。请在 Streamlit Cloud 的 Settings → Secrets 中配置。")
 
-    st.caption("OpenAI 推荐使用 Responses API。:contentReference[oaicite:3]{index=3}")
+model_name = st.text_input("模型名（默认 gpt-5.2）", value="gpt-5.2")
 
-uploaded = st.file_uploader("② 上传评论文件（CSV / Excel）", type=["csv", "xlsx"])
+uploaded = st.file_uploader("上传评论文件（CSV / Excel）", type=["csv", "xlsx"])
 
-# 评价库可选编辑（但不强迫）
-with st.expander("③ 评价库（可选编辑：默认已内置）", expanded=False):
+with st.expander("评价库（可选编辑：默认已内置）", expanded=False):
     c1, c2 = st.columns(2)
     with c1:
         pos_text = st.text_area("好评标签（一行一个）", value="\n".join(st.session_state.tag_config["pos"]), height=220)
     with c2:
         neg_text = st.text_area("差评标签（一行一个）", value="\n".join(st.session_state.tag_config["neg"]), height=220)
+
     if st.button("保存评价库"):
         pos = [x.strip() for x in pos_text.splitlines() if x.strip()]
         neg = [x.strip() for x in neg_text.splitlines() if x.strip()]
@@ -286,24 +301,24 @@ with st.expander("③ 评价库（可选编辑：默认已内置）", expanded=F
         st.success(f"已保存：好评 {len(pos)} 个 / 差评 {len(neg)} 个")
 
 if uploaded:
+    # 1) 读取 + 自动映射 + 清洗
     df_raw = load_file(uploaded)
     st.session_state.raw_df = df_raw
 
     m = auto_build_mapping(df_raw)
     st.session_state.col_map = m
 
-    # 必要列检查
     if not m.get("rating") or not m.get("text"):
-        st.error("❌ 自动识别失败：缺少星级列或内容列。请检查列名（建议：星级/内容/内容(翻译)）。")
+        st.error("❌ 自动识别失败：缺少星级列或内容列。建议列名使用：星级 / 内容 / 内容(翻译)")
         st.json(m)
         st.stop()
 
     valid, norm, invalid_cnt, time_ok = build_cleaned_frames(df_raw, m)
     st.session_state.main_df = valid
-    st.session_state.norm_df = norm
+    st.session_state.norm_df = norm.copy()
     st.session_state.full_df = None
 
-    # 看板（自动）
+    # 2) 看板（自动）
     raw_total = len(df_raw)
     valid_total = len(valid)
     neg_cnt = int((valid["rating_int"] <= 3).sum())
@@ -319,19 +334,23 @@ if uploaded:
     k4.metric("差评占比(≤3⭐)", f"{neg_rate:.1f}%")
     k5.metric("严重差评(≤2⭐)", f"{severe_rate:.1f}%")
 
-    st.bar_chart(valid["rating_int"].value_counts().reindex([1,2,3,4,5], fill_value=0).sort_index())
+    dist = valid["rating_int"].value_counts().reindex([1,2,3,4,5], fill_value=0).sort_index()
+    st.bar_chart(dist)
 
+    st.subheader("🔍 数据预览（前 8 条）")
     st.dataframe(norm.head(8))
 
-    # 一键打标按钮（唯一主按钮）
+    with st.expander("查看系统自动识别的列映射"):
+        st.json(m)
+
     st.markdown("---")
-    st.subheader("④ 一键自动打标（不需要复制粘贴任何东西）")
+    st.subheader("🚀 一键自动打标（不需要复制粘贴）")
 
     batch_size = st.slider("每批条数（越大越快，但更吃上下文）", 20, 120, 60, 10)
 
-    if st.button("🚀 一键自动打标并生成导出文件", type="primary"):
+    if st.button("一键自动打标并生成导出文件", type="primary"):
         if not api_key:
-            st.error("请先填写 OpenAI API Key（或在服务器设置 OPENAI_API_KEY）。")
+            st.error("未配置 OPENAI_API_KEY。请到 Streamlit Cloud → Settings → Secrets 设置后再试。")
             st.stop()
 
         client = OpenAI(api_key=api_key)
@@ -341,52 +360,47 @@ if uploaded:
         neg_tags = st.session_state.tag_config["neg"]
         allowed_set = set(st.session_state.tag_config["all"])
 
-        # 分组：1-3 / 4 / 5
+        if "AI_Label" not in df.columns:
+            df["AI_Label"] = ""
+
         groups = {
             "1-3": df[df["rating"] <= 3],
             "4": df[df["rating"] == 4],
             "5": df[df["rating"] == 5],
         }
 
-        # 准备输出列
-        if "AI_Label" not in df.columns:
-            df["AI_Label"] = ""
-
         total_jobs = 0
-        for _, g in groups.items():
-            total_jobs += int(np.ceil(len(g) / batch_size)) if len(g) else 0
+        for g in groups.values():
+            if len(g):
+                total_jobs += int(np.ceil(len(g) / int(batch_size)))
 
-        progress = st.progress(0)
-        job_done = 0
+        progress = st.progress(0.0)
+        done = 0
 
-        # 执行
         for mode, gdf in groups.items():
             if gdf.empty:
                 continue
-            records = gdf.to_dict("records")
 
+            records = gdf.to_dict("records")
             for i in range(0, len(records), int(batch_size)):
                 chunk = records[i:i+int(batch_size)]
                 prompt = build_api_prompt(chunk, mode, pos_tags, neg_tags)
 
-                # 调用 API
                 try:
                     results = call_openai_tagging(client, model_name, prompt, max_retries=2)
                 except Exception as e:
-                    st.error(f"❌ 模型调用失败（{mode}星 批次 {i//batch_size+1}）：{e}")
+                    st.error(f"❌ 模型调用失败（{mode}星 批次 {i//int(batch_size)+1}）：{e}")
                     st.stop()
 
-                # 回填 + 严格校验标签在库内
                 id_map = {r["id"]: validate_label(r["label"], allowed_set) for r in results}
                 mask = df["id"].isin(id_map.keys())
-                df.loc[mask, "AI_Label"] = df.loc[mask, "id"].map(id_map).fillna(df.loc[mask, "AI_Label"])
+                df.loc[mask, "AI_Label"] = df.loc[mask, "id"].map(id_map).fillna(df.loc[mask, "AI_Label"]).astype(str)
 
-                job_done += 1
-                progress.progress(min(1.0, job_done / max(1, total_jobs)))
+                done += 1
+                progress.progress(min(1.0, done / max(1, total_jobs)))
 
         st.session_state.norm_df = df
 
-        # 合并回主表
         main = st.session_state.main_df.copy()
         lab = df[["id", "AI_Label"]].copy()
         main["sys_id"] = main["sys_id"].astype(str)
@@ -395,19 +409,26 @@ if uploaded:
         merged.drop(columns=["id"], inplace=True, errors="ignore")
         st.session_state.full_df = merged
 
-        st.success("✅ 自动打标完成！你可以直接下载结果。")
+        st.success("✅ 自动打标完成！可直接下载导出文件。")
         st.dataframe(df.head(20))
 
-# 导出区（随时可下载，永远不用复制粘贴）
 st.markdown("---")
-st.subheader("⑤ 导出")
+st.subheader("⬇️ 导出")
 
 if st.session_state.norm_df is not None:
     out_norm = st.session_state.norm_df.to_csv(index=False).encode("utf-8-sig")
-    st.download_button("⬇️ 下载：normalized（id/rating/text/AI_Label）",
-                       out_norm, "tagged_reviews_normalized.csv", "text/csv")
+    st.download_button(
+        "下载：normalized（id/rating/text/AI_Label）",
+        out_norm,
+        "tagged_reviews_normalized.csv",
+        "text/csv"
+    )
 
 if st.session_state.full_df is not None:
     out_full = st.session_state.full_df.to_csv(index=False).encode("utf-8-sig")
-    st.download_button("⬇️ 下载：full（原始字段 + AI_Label）",
-                       out_full, "tagged_reviews_full.csv", "text/csv")
+    st.download_button(
+        "下载：full（原始字段 + AI_Label）",
+        out_full,
+        "tagged_reviews_full.csv",
+        "text/csv"
+    )
