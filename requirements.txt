@@ -1,5 +1,7 @@
 streamlit
 pandas
-openpyxl
 plotly
+sentence-transformers
+torch
+openpyxl
 xlsxwriter
