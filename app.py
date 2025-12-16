@@ -1,334 +1,302 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import re
-import math
-from collections import Counter, defaultdict
 import plotly.express as px
-import plotly.graph_objects as go
+from sentence_transformers import SentenceTransformer, util
+import torch
+import re
+import io
 
+# =========================
+# 0. 页面配置与安全验证
+# =========================
 st.set_page_config(
-    page_title="评论市场洞察系统",
-    page_icon="📈",
+    page_title="AI 市场洞察系统 (线上版)",
+    page_icon="🧠",
     layout="wide"
 )
 
+# --- 🔒 密码保护 (线上部署必备) ---
+# 默认密码是 admin123，您可以修改
+ACCESS_PASSWORD = "admin123" 
+
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+
+def check_password():
+    if st.session_state["password_input"] == ACCESS_PASSWORD:
+        st.session_state.logged_in = True
+    else:
+        st.error("密码错误，请重试")
+
+if not st.session_state.logged_in:
+    st.markdown("## 🔒 系统锁定 (线上部署模式)")
+    st.markdown("该分析系统包含敏感市场数据，请输入密码访问。")
+    st.text_input("访问密码", type="password", key="password_input", on_change=check_password)
+    st.stop() 
+
 # =========================
-# 1. 标签库配置 (保持不变)
+# 1. 标签库定义 (标准库)
 # =========================
 POS_LABELS = [
-    "面料舒适","质量很好","有助于锻炼","有助于缓解疼痛","保暖","舒适贴合",
-    "有压缩感","抓握式有效","合身","有助于关节炎/扳机指","增加手指灵活",
-    "促进血液循环","耐用","缓解不适","轻盈","覆盖整个手指","有助于防止肿胀"
+    "面料舒适/柔软", "做工质量好", "缓解疼痛/医疗效果", "保暖性能好", 
+    "尺码合身/舒适贴合", "提供压缩感/支撑力", "增加抓握力/防滑", 
+    "关节炎/扳机指辅助", "灵活性好", "耐用性强", "轻盈透气"
 ]
 
 NEG_LABELS = [
-    "没有作用/没有效果","缝线裂开","二手商品","质量问题","不适合",
-    "尺码太小","尺码不对","接缝处不舒适","不耐用",
-    "尺码太大","过敏","光滑/没有抓握","实物与购买数量不一致"
+    "无效/没有作用", "缝线开裂/破损", "收到二手/脏污", "面料质量差/廉价", 
+    "尺码太小/太紧", "尺码太大/太松", "接缝处磨手/不适", "不耐用/一次性", 
+    "过敏/皮疹/发痒", "太滑/没有抓握力", "数量不符/发错货", "导致血液循环受阻"
 ]
 
-POS_OTHER = "好评其他"
-NEG_OTHER = "差评其他"
+POS_OTHER = "其他好评"
+NEG_OTHER = "其他差评"
 
 # =========================
-# 2. Seed 词 (保持不变)
+# 2. AI 模型加载 (针对云端优化)
 # =========================
-SEEDS_POS = {
-    "面料舒适": ["comfortable", "soft"],
-    "质量很好": ["well made", "good quality"],
-    "有助于缓解疼痛": ["pain relief", "arthritis"],
-    "舒适贴合": ["fits well", "snug"],
-    "有压缩感": ["compression"],
-    "抓握式有效": ["grip"],
-    "耐用": ["durable"]
-}
-
-SEEDS_NEG = {
-    "没有作用/没有效果": ["no effect", "doesn't work"],
-    "尺码太小": ["too small", "tight"],
-    "尺码太大": ["too big", "loose"],
-    "质量问题": ["poor quality", "cheap"],
-    "不耐用": ["broke", "tear"],
-    "光滑/没有抓握": ["slippery", "no grip"],
-    "过敏": ["allergy", "rash"]
-}
+# 注意：使用 @st.cache_resource 确保模型只加载一次，节省云端内存
+@st.cache_resource
+def load_model():
+    # all-MiniLM-L6-v2 模型很小 (~80MB)，非常适合 Streamlit Cloud 免费版
+    return SentenceTransformer('all-MiniLM-L6-v2')
 
 # =========================
-# 3. 核心工具函数 (保持不变)
+# 3. 语义打标逻辑
+# =========================
+def semantic_classify(df, model, threshold=0.25):
+    """
+    使用向量相似度进行高精度打标
+    """
+    reviews = df['text'].tolist()
+    
+    # 1. 批量编码评论
+    review_embeddings = model.encode(reviews, convert_to_tensor=True)
+    
+    # 2. 编码标签库
+    pos_embeddings = model.encode(POS_LABELS, convert_to_tensor=True)
+    neg_embeddings = model.encode(NEG_LABELS, convert_to_tensor=True)
+    
+    # 3. 计算相似度矩阵
+    pos_sims = util.cos_sim(review_embeddings, pos_embeddings)
+    neg_sims = util.cos_sim(review_embeddings, neg_embeddings)
+    
+    final_labels = []
+    
+    # 为了显示进度条
+    progress_bar = st.progress(0)
+    total = len(df)
+    
+    for i in range(total):
+        # 每处理10%更新一次进度条，避免UI卡顿
+        if i % (total // 10 + 1) == 0:
+            progress_bar.progress(i / total)
+
+        rating = df.iloc[i]['rating']
+        
+        # 获取最高分
+        p_scores = pos_sims[i]
+        n_scores = neg_sims[i]
+        
+        best_pos_idx = torch.argmax(p_scores).item()
+        best_pos_score = p_scores[best_pos_idx].item()
+        
+        best_neg_idx = torch.argmax(n_scores).item()
+        best_neg_score = n_scores[best_neg_idx].item()
+        
+        # --- 决策逻辑 ---
+        # 1-3星：强制匹配差评库
+        if rating <= 3:
+            if best_neg_score > threshold:
+                final_labels.append(NEG_LABELS[best_neg_idx])
+            else:
+                final_labels.append(NEG_OTHER)
+        # 5星：强制匹配好评库
+        elif rating == 5:
+            if best_pos_score > threshold:
+                final_labels.append(POS_LABELS[best_pos_idx])
+            else:
+                final_labels.append(POS_OTHER)
+        # 4星：摇摆逻辑
+        else:
+            if best_neg_score > threshold and best_neg_score > best_pos_score:
+                final_labels.append(NEG_LABELS[best_neg_idx])
+            elif best_pos_score > threshold:
+                final_labels.append(POS_LABELS[best_pos_idx])
+            else:
+                final_labels.append(POS_OTHER)
+                
+    progress_bar.empty() # 清除进度条
+    return final_labels
+
+# =========================
+# 4. 辅助工具
 # =========================
 def load_file(f):
     if f.name.lower().endswith(".csv"):
-        try:
-            return pd.read_csv(f, encoding="utf-8")
-        except UnicodeDecodeError:
-            return pd.read_csv(f, encoding="gbk")
+        try: return pd.read_csv(f, encoding="utf-8")
+        except: return pd.read_csv(f, encoding="gbk")
     return pd.read_excel(f)
 
 def parse_rating(x):
-    if pd.isna(x): 
-        return np.nan
+    if pd.isna(x): return np.nan
     m = re.search(r"(\d+(\.\d+)?)", str(x))
     return float(m.group(1)) if m else np.nan
 
-def tokenize(text):
-    if not text:
-        return []
-    text = str(text).lower() # 强制转str防止报错
-    eng = re.findall(r"[a-z]+", text)
-    bigram = [f"{eng[i]} {eng[i+1]}" for i in range(len(eng)-1)]
-    zh = re.findall(r"[\u4e00-\u9fff]{2,}", text)
-    return eng + bigram + zh
+def get_sentiment_type(tag):
+    if tag in POS_LABELS or tag == POS_OTHER: return "Positive"
+    if tag in NEG_LABELS or tag == NEG_OTHER: return "Negative"
+    return "Unknown"
 
 # =========================
-# 4 & 5. 学习权重与关键词 (保持不变)
+# 5. 主程序 UI
 # =========================
-def learn_polarity_weights(texts, ratings, min_df=3):
-    neg, pos = Counter(), Counter()
-    for t, r in zip(texts, ratings):
-        toks = tokenize(t)
-        if r <= 3:
-            neg.update(toks)
-        elif r == 5:
-            pos.update(toks)
+st.title("🧠 AI 深度语义分析系统 (Cloud Ver.)")
+st.markdown("此版本运行在云端，第一次加载 AI 模型可能需要 10-20 秒，请耐心等待。")
 
-    weights = {}
-    for tok in set(neg) | set(pos):
-        fn, fp = neg[tok], pos[tok]
-        if fn + fp < min_df:
-            continue
-        # 平滑处理
-        weights[tok] = math.log((fn + 1) / (fp + 1))
-    return weights
-
-def learn_label_kw(df, polarity_weights, topk=40):
-    label_docs = defaultdict(list)
-
-    for _, r in df.iterrows():
-        toks = tokenize(r["text"])
-        if r["rating"] <= 3:
-            for lb, seeds in SEEDS_NEG.items():
-                if any(s in r["text"].lower() for s in seeds):
-                    label_docs[lb].append(toks)
-        elif r["rating"] == 5:
-            for lb, seeds in SEEDS_POS.items():
-                if any(s in r["text"].lower() for s in seeds):
-                    label_docs[lb].append(toks)
-
-    label_kw = {}
-    for lb, docs in label_docs.items():
-        c = Counter()
-        for d in docs:
-            c.update(d)
-        scores = {}
-        for tok, f in c.items():
-            if tok in polarity_weights:
-                pol = polarity_weights[tok]
-                # 过滤逻辑
-                if (lb in NEG_LABELS and pol > 0) or (lb in POS_LABELS and pol < 0):
-                    scores[tok] = abs(pol) * f
-        label_kw[lb] = dict(sorted(scores.items(), key=lambda x: x[1], reverse=True)[:topk])
-
-    for lb in POS_LABELS + NEG_LABELS:
-        label_kw.setdefault(lb, {})
-    return label_kw
-
-# =========================
-# 6. 打标逻辑 (保持不变)
-# =========================
-def score_label(tokens, kw_map):
-    return sum(kw_map.get(t, 0) for t in tokens)
-
-def choose_tag(text, rating, label_kw):
-    toks = tokenize(text)
-
-    if rating <= 3:
-        scores = {lb: score_label(toks, label_kw[lb]) for lb in NEG_LABELS}
-        best = max(scores, key=scores.get)
-        return best if scores[best] > 0 else NEG_OTHER
-
-    if rating == 5:
-        scores = {lb: score_label(toks, label_kw[lb]) for lb in POS_LABELS}
-        best = max(scores, key=scores.get)
-        return best if scores[best] > 0 else POS_OTHER
-
-    # 4星：先差评
-    neg_scores = {lb: score_label(toks, label_kw[lb]) for lb in NEG_LABELS}
-    best_neg = max(neg_scores, key=neg_scores.get)
-    if neg_scores[best_neg] > 0:
-        return best_neg
-
-    pos_scores = {lb: score_label(toks, label_kw[lb]) for lb in POS_LABELS}
-    best_pos = max(pos_scores, key=pos_scores.get)
-    return best_pos if pos_scores[best_pos] > 0 else POS_OTHER
-
-# =========================
-# 7. UI与高级可视化 (新增/修改部分)
-# =========================
-st.title("📈 评论市场洞察系统")
-st.markdown("自动打标 + 商业可视化分析")
+# 懒加载模型
+with st.spinner("正在唤醒 AI 引擎..."):
+    model = load_model()
 
 uploaded = st.file_uploader("上传评论文件（CSV / Excel）", type=["csv", "xlsx"])
 
 if uploaded:
-    with st.spinner('正在分析数据...'):
+    with st.spinner('AI 正在逐行阅读并理解评论...'):
         df = load_file(uploaded)
         
-        # 字段识别
+        # 字段自动识别
         all_cols = df.columns.tolist()
         rating_col = next((c for c in all_cols if "星" in c or "rating" in c.lower()), all_cols[0])
         text_col = next((c for c in all_cols if "内容" in c or "review" in c.lower()), all_cols[1])
-
-        # 数据预处理
+        
+        # 基础清洗
         df["rating"] = df[rating_col].apply(parse_rating).round().astype(int)
         df = df[df["rating"].between(1, 5)]
-        df["text"] = df[text_col].astype(str)
-
-        # 核心计算
-        polarity_weights = learn_polarity_weights(df["text"], df["rating"])
-        label_kw = learn_label_kw(df, polarity_weights)
-        df["Tag_Label"] = df.apply(lambda r: choose_tag(r["text"], r["rating"], label_kw), axis=1)
-
-        # 增加分类列辅助绘图
-        def get_sentiment_type(tag):
-            if tag in POS_LABELS or tag == POS_OTHER: return "Positive"
-            if tag in NEG_LABELS or tag == NEG_OTHER: return "Negative"
-            return "Unknown"
+        df["text"] = df[text_col].astype(str).fillna("")
+        
+        # AI 打标
+        df["Tag_Label"] = semantic_classify(df, model)
         df["Sentiment_Type"] = df["Tag_Label"].apply(get_sentiment_type)
-
-    st.success("✅ 数据分析完成！")
-
-    # =========================
-    # 模块 A: 宏观市场概览
-    # =========================
-    st.markdown("---")
-    st.header("1. 宏观市场概览")
-    
-    col1, col2, col3 = st.columns(3)
-    
-    # KPI 计算
-    avg_rating = df["rating"].mean()
-    neg_rate = (len(df[df["rating"]<=3]) / len(df)) * 100
-    pos_rate = (len(df[df["rating"]==5]) / len(df)) * 100
-    
-    col1.metric("平均评分 (CSAT)", f"{avg_rating:.2f} ⭐")
-    col2.metric("好评率 (5星)", f"{pos_rate:.1f}%")
-    col3.metric("差评率 (1-3星)", f"{neg_rate:.1f}%", delta_color="inverse")
-
-    # 图表：评分分布 (交互式)
-    rating_counts = df["rating"].value_counts().reset_index()
-    rating_counts.columns = ["Rating", "Count"]
-    fig_rating = px.bar(rating_counts, x="Rating", y="Count", 
-                        title="用户评分分布", color="Count", 
-                        color_continuous_scale="Blues")
-    st.plotly_chart(fig_rating, use_container_width=True)
+        
+    st.success(f"✅ 分析完成！已处理 {len(df)} 条评论。")
 
     # =========================
-    # 模块 B: 痛点与改进 (Negative)
+    # 模块 A: 宏观概览
     # =========================
     st.markdown("---")
-    st.header("2. 痛点分析：用户为什么流失？")
-    st.caption("基于差评 (1-3星) 及部分4星负面反馈的数据")
+    st.header("1. 市场宏观概览")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("平均评分", f"{df['rating'].mean():.2f} ⭐")
+    c2.metric("好评率 (5星)", f"{(len(df[df['rating']==5])/len(df)*100):.1f}%")
+    c3.metric("差评率 (1-3星)", f"{(len(df[df['rating']<=3])/len(df)*100):.1f}%", delta_color="inverse")
 
+    # =========================
+    # 模块 B: 痛点分析
+    # =========================
+    st.markdown("---")
+    st.header("2. 痛点分析 (Top Complaints)")
+    
     neg_df = df[df["Sentiment_Type"] == "Negative"]
-    
     if not neg_df.empty:
-        neg_counts = neg_df["Tag_Label"].value_counts().reset_index()
+        viz_neg_df = neg_df[neg_df["Tag_Label"] != NEG_OTHER]
+        if viz_neg_df.empty: viz_neg_df = neg_df
+
+        neg_counts = viz_neg_df["Tag_Label"].value_counts().reset_index()
         neg_counts.columns = ["Issue", "Count"]
         
-        # 1. 帕累托图 (Pareto Chart) 风格的柱状图
-        fig_neg = px.bar(neg_counts, x="Count", y="Issue", orientation='h',
-                         title="主要投诉问题排行 (Top Issues)",
-                         color="Count", color_continuous_scale="Reds")
+        fig_neg = px.bar(neg_counts, x="Count", y="Issue", orientation='h', 
+                         title="主要投诉分布", color="Count", color_continuous_scale="Reds")
         fig_neg.update_layout(yaxis={'categoryorder':'total ascending'})
         st.plotly_chart(fig_neg, use_container_width=True)
         
-        # 2. 深入挖掘具体问题
-        col_b1, col_b2 = st.columns([1, 2])
-        with col_b1:
-            selected_issue = st.selectbox("选择一个问题深入分析关键词:", neg_counts["Issue"].unique())
-        
-        with col_b2:
-            if selected_issue in label_kw:
-                keywords = label_kw[selected_issue]
-                if keywords:
-                    kw_df = pd.DataFrame(list(keywords.items()), columns=["Keyword", "Weight"]).head(15)
-                    fig_kw = px.bar(kw_df, x="Keyword", y="Weight", 
-                                    title=f"'{selected_issue}' 的高频触发词",
-                                    color="Weight", color_continuous_scale="Reds")
-                    st.plotly_chart(fig_kw, use_container_width=True)
-                else:
-                    st.info("该标签为通用标签或未提取到显著特征词。")
-            else:
-                st.info("该标签属于'其他'类，暂无特定特征词。")
+        st.subheader("🔍 痛点原声透视")
+        col_n1, col_n2 = st.columns([1, 2])
+        with col_n1:
+            sel_neg_tag = st.selectbox("选择痛点标签:", neg_counts["Issue"].unique())
+        with col_n2:
+            st.markdown(f"**用户抱怨 '{sel_neg_tag}' 的原话:**")
+            sample_neg = neg_df[neg_df["Tag_Label"] == sel_neg_tag].sort_values(by="text", key=lambda x: x.str.len(), ascending=False).head(5)
+            for i, row in sample_neg.iterrows():
+                with st.expander(f"💔 {row['rating']}星: ...{row['text'][:50]}..."):
+                    st.write(row['text'])
     else:
-        st.write("暂无差评数据，产品表现完美！")
+        st.info("暂无明显差评数据。")
 
     # =========================
-    # 模块 C: 卖点与营销 (Positive)
+    # 模块 C: 卖点挖掘
     # =========================
     st.markdown("---")
-    st.header("3. 卖点挖掘：广告语该怎么写？")
-    st.caption("基于好评 (5星) 及部分4星正面反馈的数据")
-
-    pos_df = df[df["Sentiment_Type"] == "Positive"]
+    st.header("3. 卖点挖掘 (Selling Points)")
     
+    pos_df = df[df["Sentiment_Type"] == "Positive"]
     if not pos_df.empty:
-        pos_counts = pos_df["Tag_Label"].value_counts().reset_index()
-        pos_counts.columns = ["Selling Point", "Count"]
-
-        # 树状图 (Treemap)：适合展示层级占比，很有营销感
-        fig_tree = px.treemap(pos_counts, path=['Selling Point'], values='Count',
-                              title="用户最欣赏的功能点 (Treemap)",
+        viz_pos_df = pos_df[pos_df["Tag_Label"] != POS_OTHER]
+        if viz_pos_df.empty: viz_pos_df = pos_df
+        
+        pos_counts = viz_pos_df["Tag_Label"].value_counts().reset_index()
+        pos_counts.columns = ["Feature", "Count"]
+        
+        fig_tree = px.treemap(pos_counts, path=['Feature'], values='Count',
+                              title="卖点权重分布",
                               color='Count', color_continuous_scale='Greens')
         st.plotly_chart(fig_tree, use_container_width=True)
         
-        # 关键词提取用于文案
-        st.subheader("💡 营销文案灵感 (Copywriting Ideas)")
-        top_pos_tag = pos_counts.iloc[0]["Selling Point"]
-        st.markdown(f"用户最常提到的优点是 **{top_pos_tag}**。")
+        st.subheader("💡 卖点原声透视")
+        col_p1, col_p2 = st.columns([1, 2])
         
-        if top_pos_tag in label_kw:
-            top_words = list(label_kw[top_pos_tag].keys())[:10]
-            st.info(f"推荐广告高频词: {', '.join(top_words)}")
-
-    # =========================
-    # 模块 D: 机会挖掘 (The 4-Star Gap)
-    # =========================
-    st.markdown("---")
-    st.header("4. 机会挖掘：如何拯救摇摆用户 (4星分析)")
-    st.caption("4星用户通常对产品大体满意，但有一两个具体抱怨。解决这些问题最能提升评分。")
-
-    four_star_df = df[df["rating"] == 4]
-    if not four_star_df.empty:
-        # 统计4星里的差评标签 vs 好评标签
-        fs_counts = four_star_df["Tag_Label"].value_counts().reset_index()
-        fs_counts.columns = ["Label", "Count"]
-        fs_counts["Type"] = fs_counts["Label"].apply(get_sentiment_type)
-        
-        fig_4s = px.sunburst(fs_counts, path=['Type', 'Label'], values='Count',
-                             title="4星用户评价构成 (Sunburst)",
-                             color='Type', color_discrete_map={'Positive':'#66c2a5', 'Negative':'#d53e4f', 'Unknown':'#grey'})
-        st.plotly_chart(fig_4s, use_container_width=True)
-        
-        # 找出4星用户最主要的抱怨
-        fs_neg = fs_counts[fs_counts["Type"] == "Negative"]
-        if not fs_neg.empty:
-            top_complaint = fs_neg.iloc[0]["Label"]
-            st.warning(f"⚠️ 阻碍4星用户给出满分的最大障碍是：**{top_complaint}**")
+        with col_p1:
+            sel_pos_tag = st.selectbox("选择卖点标签:", pos_counts["Feature"].unique())
+        with col_p2:
+            st.markdown(f"**用户夸赞 '{sel_pos_tag}' 的原话:**")
+            sample_pos = pos_df[pos_df["Tag_Label"] == sel_pos_tag].sort_values(by="text", key=lambda x: x.str.len(), ascending=False).head(5)
+            for i, row in sample_pos.iterrows():
+                with st.expander(f"❤️ 5星: ...{row['text'][:50]}..."):
+                    st.write(row['text'])
     else:
-        st.write("样本中没有4星评价。")
+        st.info("暂无好评数据。")
 
     # =========================
-    # 数据下载区
+    # 模块 D: 机会挖掘
     # =========================
     st.markdown("---")
-    st.subheader("📥 数据导出")
-    st.dataframe(df[[rating_col, "Tag_Label", "text"]].head(50))
+    st.header("4. 机会挖掘 (4-Star Analysis)")
+    four_star = df[df['rating'] == 4]
+    if not four_star.empty:
+        f_counts = four_star["Tag_Label"].value_counts().reset_index()
+        f_counts.columns = ["Label", "Count"]
+        f_counts["Type"] = f_counts["Label"].apply(get_sentiment_type)
+        
+        fig_sun = px.sunburst(f_counts, path=['Type', 'Label'], values='Count',
+                              title="4星评价成分分析",
+                              color='Type', 
+                              color_discrete_map={'Positive':'#66c2a5', 'Negative':'#d53e4f', 'Unknown':'#999999'})
+        st.plotly_chart(fig_sun, use_container_width=True)
+    else:
+        st.write("暂无4星评论。")
+
+    # =========================
+    # 下载区
+    # =========================
+    st.markdown("---")
+    
+    # CSV 下载
+    csv_data = df.to_csv(index=False).encode('utf-8-sig')
+    st.download_button(
+        "⬇️ 下载分析报表 (CSV)",
+        data=csv_data,
+        file_name="ai_analysis_report.csv",
+        mime="text/csv"
+    )
+    
+    # Excel 下载 (解决乱码最稳妥的方式)
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+        df.to_excel(writer, index=False, sheet_name='Analysis')
     
     st.download_button(
-        "⬇️ 下载完整分析报表 (CSV)",
-        df.to_csv(index=False).encode("utf-8-sig"),
-        "market_insight_report.csv",
-        "text/csv"
+        label="⬇️ 下载分析报表 (Excel - 推荐)",
+        data=buffer.getvalue(),
+        file_name="ai_analysis_report.xlsx",
+        mime="application/vnd.ms-excel"
     )
