@@ -1,9 +1,9 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.express as px
+import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
 from sentence_transformers import SentenceTransformer, util
-from sklearn.feature_extraction.text import CountVectorizer
 import torch
 import re
 import io
@@ -11,7 +11,15 @@ import io
 # =========================
 # 0. 页面配置与安全验证
 # =========================
-st.set_page_config(page_title="AI 评论分析 (语义修正版)", page_icon="🎯", layout="wide")
+st.set_page_config(
+    page_title="AI 评论精细化分析系统 (NLP Engineer Ver.)",
+    page_icon="🔬",
+    layout="wide"
+)
+
+# 解决 Matplotlib 中文乱码问题 (尝试使用系统通用字体)
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS', 'sans-serif']
+plt.rcParams['axes.unicode_minus'] = False
 
 ACCESS_PASSWORD = "admin123" 
 
@@ -30,166 +38,157 @@ if not st.session_state.logged_in:
     st.stop() 
 
 # =========================
-# 1. 标签库与关键词规则 (深度优化)
+# 1. 标签库定义 (严格遵守)
 # =========================
-# 逻辑说明：如果评论中包含列表里的词，该标签的分数会获得巨大加成。
 
-POS_LABELS_MAP = {
-    # 提高 "功能性" 标签的优先级，防止被 "舒适" 掩盖
-    "提供压缩感/支撑力": ["compression", "pressure", "support", "tightness", "squeeze", "压力", "压缩", "支撑", "紧实", "包裹"],
-    "缓解疼痛/医疗效果": ["pain", "relief", "arthritis", "ache", "soothing", "hurts", "疼痛", "缓解", "关节炎", "止痛", "疗效"],
-    "增加抓握力/防滑": ["grip", "traction", "slip", "rubber", "抓握", "防滑", "摩擦", "稳"],
-    "保暖性能好": ["warm", "heat", "cold", "winter", "保暖", "热", "冷", "温"],
-    
-    # 通用标签放在后面
-    "面料舒适/柔软": ["soft", "comfortable", "fabric", "cotton", "smooth", "cozy", "舒适", "软", "棉", "舒服"],
-    "做工质量好": ["quality", "well made", "sturdy", "stitch", "质量", "做工", "缝线", "耐用"],
-    "尺码合身/舒适贴合": ["fit", "size", "snug", "perfect", "true to size", "合身", "合适", "贴合"],
-    "耐用性强": ["durable", "last", "wash", "wear", "耐用", "洗", "磨损"],
-    "灵活性好": ["dexterity", "flexible", "type", "write", "灵活", "打字", "活动"],
-}
+# 好评标签库 (固定集合)
+POS_LABELS_LIST = [
+    "面料舒适", "质量很好", "有助于锻炼", "有助于缓解疼痛", "保暖", "舒适贴合", 
+    "有压缩感", "抓握式有效", "合身", "有助于关节炎/扳机指", "增加手指灵活", 
+    "促进血液循环", "耐用", "缓解不适", "轻盈", "覆盖整个手指", "有助于防止受伤"
+]
 
-NEG_LABELS_MAP = {
-    # 针对您的案例1：增加 "袖口", "伸不进" 等具体场景词
-    "尺码太小/太紧/伸不进去": [
-        "small", "tight", "cut off", "circulation", "cuff", "hand in", "wrist", "opening", 
-        "restrict", "squeeze", "tiny", "child",
-        "紧", "小", "勒", "伸不进", "窄", "袖口", "穿不", "进不去", "卡住", "血液循环"
-    ],
-    "尺码太大/太松": ["big", "loose", "huge", "large", "baggy", "fall off", "long", "松", "大", "长", "掉"],
-    "太滑/没有抓握力": ["slippery", "slide", "no grip", "smooth", "plastic", "drop", "滑", "抓不住", "溜"],
-    "缝线开裂/破损": ["seam", "rip", "tear", "hole", "split", "fray", "thread", "unravel", "缝线", "破", "洞", "开裂", "线头", "裂"],
-    "无效/没有作用": ["work", "effect", "useless", "help", "difference", "waste", "无效", "没用", "智商税", "不值"],
-    "过敏/皮疹/发痒": ["rash", "itch", "allergy", "skin", "red", "bump", "痒", "过敏", "红肿", "刺挠"],
-    "面料质量差/廉价": ["material", "thin", "cheap", "rough", "scratchy", "junk", "paper", "面料", "薄", "粗糙", "廉价", "烂"],
-    "数量不符/发错货": ["count", "missing", "wrong", "received", "order", "数量", "少", "发错", "缺"],
-}
-
-# 提取标签列表
-POS_LABELS = list(POS_LABELS_MAP.keys())
-NEG_LABELS = list(NEG_LABELS_MAP.keys())
+# 差评标签库 (沿用旧版逻辑，补充完整以覆盖常见差评)
+NEG_LABELS_LIST = [
+    "无效/没有作用", "缝线开裂/破损", "收到二手/脏污", "面料质量差/廉价", 
+    "尺码太小/太紧", "尺码太大/太松", "接缝处磨手/不适", "不耐用/一次性", 
+    "过敏/皮疹/发痒", "太滑/没有抓握力", "数量不符/发错货", "导致血液循环受阻"
+]
 
 # =========================
 # 2. AI 模型加载
 # =========================
 @st.cache_resource
 def load_model():
+    # 使用多语言模型处理中英文语义
     return SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
 
 # =========================
-# 3. 核心功能：混合打标 (关键词 > 语义)
+# 3. 核心 NLP 引擎：拆句与匹配
 # =========================
-def extract_dynamic_label(text, model, ngram_range=(2, 3)):
-    try:
-        is_chinese = bool(re.search(r'[\u4e00-\u9fff]', text))
-        analyzer_type = 'char' if is_chinese else 'word'
-        count = CountVectorizer(ngram_range=ngram_range, analyzer=analyzer_type, stop_words='english').fit([text])
-        candidates = count.get_feature_names_out()
-        if len(candidates) == 0: return "其他未分类"
-        doc_embedding = model.encode([text])
-        candidate_embeddings = model.encode(candidates)
-        distances = util.cos_sim(doc_embedding, candidate_embeddings)
-        keywords = [candidates[index] for index in distances.argsort()[0][-1:]]
-        tag = keywords[0]
-        return tag.replace(" ", "") if is_chinese else tag.title()
-    except:
-        return "其他(文本过短)"
 
-def hybrid_classify(df, model, match_threshold=0.35):
+def split_into_sentences(text):
     """
-    逻辑升级：
-    1. 关键词命中时，给予巨大加分 (Bonus +1.5)，确保覆盖语义相似度。
-    2. 如果有特定功能词（如“压力”），优先于通用词（如“舒适”）。
+    语义拆解：将长评论拆分为独立句子/语义单元。
+    支持中英文标点及换行符。
     """
-    reviews = df['text'].tolist()
-    
-    review_embeddings = model.encode(reviews, convert_to_tensor=True)
-    pos_embeddings = model.encode(POS_LABELS, convert_to_tensor=True)
-    neg_embeddings = model.encode(NEG_LABELS, convert_to_tensor=True)
-    
-    pos_sims = util.cos_sim(review_embeddings, pos_embeddings)
-    neg_sims = util.cos_sim(review_embeddings, neg_embeddings)
-    
-    final_labels = []
-    sentiment_display = []
-    is_new_label = []
+    if not isinstance(text, str):
+        return []
+    # 使用正则按 . ! ? ; 。 ！？ ；以及换行符进行切分
+    sentences = re.split(r'[.!?;。！？；\n]+', text)
+    # 过滤空字符串并去除首尾空格
+    return [s.strip() for s in sentences if s.strip()]
 
-    progress_bar = st.progress(0)
-    total = len(df)
+def analyze_single_review(row_idx, rating, full_text, model, threshold=0.40):
+    """
+    对单条评论进行细粒度分析，返回多个结构化结果。
+    """
+    sentences = split_into_sentences(full_text)
+    analyzed_results = []
     
-    for i in range(total):
-        if i % 10 == 0: progress_bar.progress(i / total)
+    # 预编码标签库 (Tensor)
+    pos_embeddings = model.encode(POS_LABELS_LIST, convert_to_tensor=True)
+    neg_embeddings = model.encode(NEG_LABELS_LIST, convert_to_tensor=True)
 
-        rating = df.iloc[i]['rating']
-        text = str(df.iloc[i]['text']).lower()
+    # 评论整体情感基调 (简单规则：<=3星为负向，>=4星为正向)
+    review_polarity_base = "negative" if rating <= 3 else "positive"
+
+    if not sentences:
+        # 如果评论为空或无法拆分，直接返回整句的兜底
+        return [{
+            "review_id": row_idx,
+            "original_review": full_text,
+            "sentence": str(full_text),
+            "polarity": review_polarity_base,
+            "label": "差评其他" if review_polarity_base == "negative" else "好评其他",
+            "evidence": str(full_text),
+            "confidence": 0.5
+        }]
+
+    for sent in sentences:
+        # 忽略太短的无意义片段 (如 "OK", "嗯")
+        if len(sent) < 2:
+            continue
+
+        # 编码当前句子
+        sent_embedding = model.encode(sent, convert_to_tensor=True)
+
+        # 计算相似度
+        pos_scores = util.cos_sim(sent_embedding, pos_embeddings)[0]
+        neg_scores = util.cos_sim(sent_embedding, neg_embeddings)[0]
+
+        best_pos_score = torch.max(pos_scores).item()
+        best_pos_idx = torch.argmax(pos_scores).item()
         
-        # --- 关键词强力加权 ---
-        
-        # 1. 处理差评
-        current_neg_scores = neg_sims[i].clone()
-        for idx, label in enumerate(NEG_LABELS):
-            keywords = NEG_LABELS_MAP[label]
-            # 检查是否包含关键词
-            if any(k in text for k in keywords):
-                # +1.5 是一个巨大的权重，基本能保证只要有关键词，就选这个标签
-                current_neg_scores[idx] += 1.5 
+        best_neg_score = torch.max(neg_scores).item()
+        best_neg_idx = torch.argmax(neg_scores).item()
 
-        # 2. 处理好评
-        current_pos_scores = pos_sims[i].clone()
-        for idx, label in enumerate(POS_LABELS):
-            keywords = POS_LABELS_MAP[label]
-            if any(k in text for k in keywords):
-                # 针对案例2：如果是"压缩/压力"类词，加分更高，压过"舒适"
-                if "压缩" in label or "compression" in label.lower():
-                     current_pos_scores[idx] += 2.0 
+        # 决策逻辑 (Winner Takes All for this sentence)
+        matched_label = None
+        matched_polarity = None
+        confidence = 0.0
+
+        # 1. 比较正向和负向的最高分
+        if best_pos_score > best_neg_score:
+            # 倾向于好评
+            if best_pos_score > threshold:
+                matched_label = POS_LABELS_LIST[best_pos_idx]
+                matched_polarity = "positive"
+                confidence = best_pos_score
+            else:
+                # 没过阈值，但句子看起来是中性/正向的
+                # 这里我们利用整条评论的星级做兜底
+                if review_polarity_base == "positive":
+                    matched_label = "好评其他"
+                    matched_polarity = "positive"
+                    confidence = 0.3 # 低置信度
                 else:
-                     current_pos_scores[idx] += 1.5
-
-        # 获取最佳匹配
-        best_pos_idx = torch.argmax(current_pos_scores).item()
-        best_pos_score = current_pos_scores[best_pos_idx].item()
-        
-        best_neg_idx = torch.argmax(current_neg_scores).item()
-        best_neg_score = current_neg_scores[best_neg_idx].item()
-        
-        label = None
-        s_display = "未知"
-        is_new = False
-        
-        # --- 严格的情感判定 (修复评分逻辑) ---
-        if rating <= 3:
-            is_negative = True
-        elif rating == 4:
-            is_negative = best_neg_score > best_pos_score
+                    # 星级是差评，但这句话没匹配到差评库，可能是一句废话或“其他”
+                    # 暂时忽略，除非它是该评论唯一的句子
+                    pass 
         else:
-            is_negative = False
-
-        # --- 最终决策 ---
-        if is_negative:
-            s_display = "差评"
-            # 阈值判断：如果有关键词加成，分数肯定 > 1.0，直接通过
-            if best_neg_score > match_threshold:
-                label = NEG_LABELS[best_neg_idx]
+            # 倾向于差评
+            if best_neg_score > threshold:
+                matched_label = NEG_LABELS_LIST[best_neg_idx]
+                matched_polarity = "negative"
+                confidence = best_neg_score
             else:
-                label = extract_dynamic_label(df.iloc[i]['text'], model)
-                is_new = True
-        else:
-            s_display = "好评"
-            if best_pos_score > match_threshold:
-                label = POS_LABELS[best_pos_idx]
-            else:
-                label = extract_dynamic_label(df.iloc[i]['text'], model)
-                is_new = True
-        
-        final_labels.append(label)
-        sentiment_display.append(s_display)
-        is_new_label.append(is_new)
+                if review_polarity_base == "negative":
+                    matched_label = "差评其他"
+                    matched_polarity = "negative"
+                    confidence = 0.3
+                else:
+                    pass
 
-    progress_bar.empty()
-    return final_labels, sentiment_display, is_new_label
+        # 如果句子没匹配到任何具体标签，且被判定为“其他”，存入结果
+        if matched_label:
+            analyzed_results.append({
+                "review_id": row_idx,
+                "original_review": full_text,
+                "sentence": sent,
+                "polarity": matched_polarity,
+                "label": matched_label,
+                "evidence": sent, # 强证据：直接引用原句
+                "confidence": round(confidence, 4)
+            })
+
+    # 兜底逻辑：如果整条评论拆完后，连一个标签都没打上（所有句子都低于阈值且被忽略）
+    if not analyzed_results:
+        fallback_label = "差评其他" if review_polarity_base == "negative" else "好评其他"
+        analyzed_results.append({
+            "review_id": row_idx,
+            "original_review": full_text,
+            "sentence": "(整段语义模糊)",
+            "polarity": review_polarity_base,
+            "label": fallback_label,
+            "evidence": full_text,
+            "confidence": 0.0
+        })
+
+    return analyzed_results
 
 # =========================
-# 4. 辅助工具 (严格评分解析)
+# 4. 辅助工具
 # =========================
 def load_file(f):
     if f.name.lower().endswith(".csv"):
@@ -198,132 +197,177 @@ def load_file(f):
     return pd.read_excel(f)
 
 def parse_rating_strict(x):
+    """强制提取评分整数"""
     if pd.isna(x): return np.nan
     s = str(x)
     m = re.search(r"(\d+(\.\d+)?)", s)
     if m:
         val = float(m.group(1))
-        val_int = int(round(val)) # 四舍五入
-        if val_int < 1: val_int = 1
-        if val_int > 5: val_int = 5
-        return val_int
+        val_int = int(round(val))
+        return max(1, min(5, val_int))
     return np.nan
 
 # =========================
 # 5. 主程序 UI
 # =========================
-st.title("🎯 AI 评论分析 (精准语义修正版)")
+st.title("🔬 AI 评论精细化分析系统")
 st.markdown("""
-**本次修正重点：**
-1. **解决“袖口伸不进”问题**：增加了 `袖口`, `伸不进`, `cuff` 等强规则词，强制识别为【尺码太小/太紧】。
-2. **解决“压力被泛化”问题**：提高了功能性词汇（如 `压力`, `compression`）的权重，优先于通用的“舒适”。
-3. **评分统计修复**：强制将所有评分（如 3.0）转为整数，准确统计差评。
+**核心逻辑更新：**
+1. **语义拆解**：自动将长评论拆分为独立句子，分别打标（解决一条评论既好又坏的问题）。
+2. **强证据约束**：标签必须对应原文的具体句子 (`evidence`)。
+3. **兜底规则**：未匹配到库的语义，依据星级归入“好评其他”或“差评其他”。
 """)
 
-with st.spinner("AI 引擎加载中..."):
+with st.spinner("正在加载 NLP 语义模型..."):
     model = load_model()
 
 uploaded = st.file_uploader("上传评论文件 (CSV/Excel)", type=["csv", "xlsx"])
 
 if uploaded:
-    with st.spinner('正在进行关键词增强分析...'):
-        df = load_file(uploaded)
+    with st.spinner('正在逐句拆解并分析语义...'):
+        df_raw = load_file(uploaded)
         
-        all_cols = df.columns.tolist()
+        # 1. 字段识别
+        all_cols = df_raw.columns.tolist()
         rating_col = next((c for c in all_cols if "星" in str(c) or "rating" in str(c).lower()), all_cols[0])
         text_col = next((c for c in all_cols if "内容" in str(c) or "review" in str(c).lower() or "text" in str(c).lower()), all_cols[1])
-
-        # 严格清洗
-        df["rating_clean"] = df[rating_col].apply(parse_rating_strict)
-        df = df.dropna(subset=["rating_clean"])
-        df["rating_clean"] = df["rating_clean"].astype(int)
-        df["text"] = df[text_col].astype(str).fillna("")
-        df["rating"] = df["rating_clean"]
         
-        # 核心运算
-        labels, sentiments, is_new = hybrid_classify(df, model)
-        df["标签"] = labels
-        df["情感分类"] = sentiments
-        df["是否新标签"] = is_new
+        # 2. 清洗
+        df_raw["rating_clean"] = df_raw[rating_col].apply(parse_rating_strict)
+        df_raw = df_raw.dropna(subset=["rating_clean"])
+        df_raw["text_clean"] = df_raw[text_col].astype(str).fillna("")
         
-    st.success("✅ 分析完成！")
-
-    # =========================
-    # A: 宏观概览
-    # =========================
-    st.markdown("---")
-    st.header("1. 宏观概览")
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("评论总数", len(df))
-    avg_score = df['rating'].mean()
-    k2.metric("平均评分", f"{avg_score:.2f} ⭐")
-    
-    neg_count = len(df[df['rating'] <= 3])
-    neg_rate = (neg_count / len(df) * 100) if len(df) > 0 else 0
-    k3.metric("差评占比 (<=3星)", f"{neg_rate:.1f}%", delta_color="inverse")
-    k4.metric("新标签挖掘", sum(is_new))
-    
-    # 评分分布
-    counts = df['rating'].value_counts().reindex([1,2,3,4,5], fill_value=0).reset_index()
-    counts.columns = ["星级", "数量"]
-    counts["星级"] = counts["星级"].astype(str) + "星"
-    fig_bar = px.bar(counts, x="星级", y="数量", text="数量", color="数量", color_continuous_scale="Blues")
-    st.plotly_chart(fig_bar, use_container_width=True)
-
-    # =========================
-    # B: 深度分析
-    # =========================
-    st.markdown("---")
-    st.header("2. 标签深度分析")
-    c1, c2 = st.columns(2)
-    with c1:
-        s_counts = df["情感分类"].value_counts().reset_index()
-        s_counts.columns = ["情感", "数量"]
-        fig_pie = px.pie(s_counts, values="数量", names="情感", hole=0.4, 
-                         color="情感", color_discrete_map={"好评":"#2ecc71", "差评":"#e74c3c"})
-        st.plotly_chart(fig_pie, use_container_width=True)
-    with c2:
-        viz_df = df.copy()
-        tc = viz_df["标签"].value_counts()
-        viz_df["标签展示"] = viz_df["标签"].apply(lambda x: x if tc[x] > 0 else "其他")
-        sun_df = viz_df.groupby(["情感分类", "标签展示"]).size().reset_index(name="数量")
-        fig_sun = px.sunburst(sun_df, path=['情感分类', '标签展示'], values='数量',
-                              color='情感分类', color_discrete_map={"好评":"#2ecc71", "差评":"#e74c3c"})
-        st.plotly_chart(fig_sun, use_container_width=True)
-
-    # =========================
-    # C: 验证区 (查找特定评论)
-    # =========================
-    st.markdown("---")
-    st.header("3. 结果验证")
-    st.caption("检查特定标签下的评论是否准确")
-    
-    col_v1, col_v2 = st.columns(2)
-    with col_v1:
-        # 差评验证
-        neg_issues = df[df["情感分类"] == "差评"]["标签"].unique().tolist()
-        if neg_issues:
-            sel_neg = st.selectbox("查看差评标签:", neg_issues)
-            reviews_n = df[df["标签"] == sel_neg]["text"].head(3)
-            for r in reviews_n: st.error(r)
-        else:
-            st.info("无差评")
+        # 3. 核心运算：生成结构化打标表 (Granular DataFrame)
+        all_structured_data = []
+        
+        # 进度条
+        progress_bar = st.progress(0)
+        total_rows = len(df_raw)
+        
+        for idx, row in df_raw.iterrows():
+            if idx % 10 == 0: progress_bar.progress(idx / total_rows)
             
-    with col_v2:
-        # 好评验证
-        pos_issues = df[df["情感分类"] == "好评"]["标签"].unique().tolist()
-        if pos_issues:
-            sel_pos = st.selectbox("查看好评标签:", pos_issues)
-            reviews_p = df[df["标签"] == sel_pos]["text"].head(3)
-            for r in reviews_p: st.success(r)
-        else:
-            st.info("无好评")
+            # 调用拆句分析函数
+            results = analyze_single_review(
+                row_idx=idx, # 使用索引作为 ID
+                rating=row["rating_clean"],
+                full_text=row["text_clean"],
+                model=model
+            )
+            all_structured_data.extend(results)
+            
+        progress_bar.empty()
+        
+        # 生成最终 DataFrame
+        detailed_df = pd.DataFrame(all_structured_data)
+        
+    st.success(f"✅ 分析完成！原数据 {len(df_raw)} 条，拆解出 {len(detailed_df)} 个语义单元。")
 
     # =========================
-    # 下载
+    # A: 结构化数据展示
     # =========================
     st.markdown("---")
+    st.header("1. 结构化打标结果 (Structured Data)")
+    st.markdown("每一行代表一个“语义单元”，而非一条完整的评论。")
+    
+    st.dataframe(
+        detailed_df[["review_id", "label", "evidence", "sentence", "confidence"]], 
+        use_container_width=True,
+        height=400
+    )
+
+    # =========================
+    # B: 统计可视化 (Matplotlib 降级方案)
+    # =========================
+    st.markdown("---")
+    st.header("2. 标签分布统计")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("Top 10 标签分布")
+        # 统计标签频率
+        label_counts = detailed_df["label"].value_counts().head(10)
+        
+        # 使用 Matplotlib 绘图
+        fig, ax = plt.subplots(figsize=(8, 5))
+        # 颜色映射：好评绿，差评红，其他灰
+        colors = []
+        for lbl in label_counts.index:
+            if "其他" in lbl: colors.append("#95a5a6")
+            elif lbl in POS_LABELS_LIST: colors.append("#2ecc71")
+            else: colors.append("#e74c3c")
+            
+        bars = ax.barh(label_counts.index, label_counts.values, color=colors)
+        ax.invert_yaxis() # 翻转Y轴让第一名在上面
+        ax.set_xlabel("Mentions")
+        ax.set_title("Label Frequency")
+        
+        # 在柱状图上添加数值
+        for bar in bars:
+            width = bar.get_width()
+            ax.text(width + 0.5, bar.get_y() + bar.get_height()/2, 
+                    f'{int(width)}', ha='left', va='center')
+            
+        st.pyplot(fig)
+
+    with col2:
+        st.subheader("情感占比 (拆句后)")
+        polarity_counts = detailed_df["polarity"].value_counts()
+        
+        fig2, ax2 = plt.subplots(figsize=(6, 6))
+        ax2.pie(
+            polarity_counts.values, 
+            labels=polarity_counts.index, 
+            autopct='%1.1f%%', 
+            colors=["#e74c3c", "#2ecc71", "#3498db"],
+            startangle=90
+        )
+        ax2.set_title("Polarity Distribution (Sentence Level)")
+        st.pyplot(fig2)
+
+    # =========================
+    # C: 证据回溯工具
+    # =========================
+    st.markdown("---")
+    st.header("3. 证据回溯 (Traceability)")
+    
+    selected_label = st.selectbox("选择一个标签查看证据:", detailed_df["label"].unique())
+    
+    evidence_df = detailed_df[detailed_df["label"] == selected_label][["review_id", "evidence", "original_review"]]
+    
+    if not evidence_df.empty:
+        st.write(f"共找到 {len(evidence_df)} 条证据：")
+        for i, row in evidence_df.head(5).iterrows():
+            with st.expander(f"Review #{row['review_id']}: \"{row['evidence']}\""):
+                st.info(f"**完整原文:** {row['original_review']}")
+    else:
+        st.write("无数据")
+
+    # =========================
+    # 下载区
+    # =========================
+    st.markdown("---")
+    
+    # 导出 CSV
+    csv_buffer = detailed_df.to_csv(index=False).encode('utf-8-sig')
+    st.download_button(
+        label="⬇️ 下载结构化打标结果 (CSV)",
+        data=csv_buffer,
+        file_name="structured_analysis_result.csv",
+        mime="text/csv"
+    )
+    
+    # 导出 Excel
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-        df.to_excel(writer, index=False, sheet_name='Result')
-    st.download_button("⬇️ 下载 Excel 结果", buffer.getvalue(), "fixed_analysis.xlsx", "application/vnd.ms-excel")
+        detailed_df.to_excel(writer, index=False, sheet_name='Structured_Data')
+        # 同时也把原始数据放进去方便对比
+        df_raw.to_excel(writer, index=False, sheet_name='Raw_Data')
+        
+    st.download_button(
+        label="⬇️ 下载完整分析报表 (Excel)",
+        data=buffer.getvalue(),
+        file_name="structured_analysis_report.xlsx",
+        mime="application/vnd.ms-excel"
+    )
